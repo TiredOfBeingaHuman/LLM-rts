@@ -1,469 +1,412 @@
 import math
 from utils import distance, normalize, angle_between
+import random
+from config import ResourceConfig
 
 class Behavior:
-    """Base class for all unit behaviors."""
+    """Base class for all behaviors."""
     
     def __init__(self, unit):
         self.unit = unit
     
     def update(self, dt):
         """Update behavior state."""
-        pass
+        raise NotImplementedError("Subclasses must implement update()")
     
     def enter(self):
-        """Called when this behavior becomes active."""
+        """Called when behavior becomes active."""
         pass
     
     def exit(self):
-        """Called when this behavior is no longer active."""
+        """Called when behavior is no longer active."""
         pass
     
     def is_finished(self):
-        """Return True if this behavior is complete."""
+        """Check if behavior is complete."""
         return False
+        
+    def _standardized_move_toward(self, target_position, dt, force_scale=None):
+        """Standardized movement logic used by all behaviors.
+        
+        Args:
+            target_position: The position to move toward
+            dt: Delta time
+            force_scale: Optional force scaling factor (defaults to unit's steering_force)
+        """
+        if force_scale is None:
+            force_scale = self.unit.steering_force
+            
+        # Calculate distance and direction to target
+        dx = target_position[0] - self.unit.position[0]
+        dy = target_position[1] - self.unit.position[1]
+        dist = math.sqrt(dx*dx + dy*dy)
+        
+        if dist > 0:
+            # Normalize direction
+            dir_x = dx / dist
+            dir_y = dy / dist
+            
+            # Calculate if we're in deceleration range
+            arrival_threshold = self.unit.target_reached_threshold
+            deceleration_radius = 150.0
+            
+            # Calculate deceleration factor if close to target
+            decel_factor = 1.0
+            if dist < deceleration_radius:
+                # Linearly scale from 1.0 at deceleration_radius to 0.3 at arrival_threshold
+                decel_factor = 0.3 + 0.7 * (dist - arrival_threshold) / (deceleration_radius - arrival_threshold)
+                decel_factor = max(0.3, min(1.0, decel_factor))
+            
+            # Calculate force to apply
+            force_intensity = force_scale * decel_factor
+                
+            # Apply steering force toward target
+            self.unit.apply_force(dir_x * force_intensity, dir_y * force_intensity)
+            
+            # Update unit angle to face movement direction if moving
+            if abs(self.unit.velocity[0]) > 1 or abs(self.unit.velocity[1]) > 1:
+                self.unit.angle = angle_between((0, 0), (self.unit.velocity[0], self.unit.velocity[1]))
+            else:
+                # If almost stopped, face the target
+                self.unit.angle = angle_between((0, 0), (dx, dy))
+                
+        return dist <= arrival_threshold
 
 class IdleBehavior(Behavior):
     """Behavior for a unit that's idle."""
     
     def update(self, dt):
-        # Do nothing while idle
-        pass
+        # Actively stop movement for units in idle state
+        if hasattr(self.unit, 'velocity'):
+            # Apply stronger damping to velocities when idle to prevent unwanted movement
+            self.unit.velocity[0] *= 0.8
+            self.unit.velocity[1] *= 0.8
+            
+            # If velocity is very small, zero it out completely 
+            if abs(self.unit.velocity[0]) < 0.5 and abs(self.unit.velocity[1]) < 0.5:
+                self.unit.velocity[0] = 0
+                self.unit.velocity[1] = 0
+        
+        return False
 
 class MoveBehavior(Behavior):
-    """Behavior for moving to a target position."""
+    """Behavior for moving to a target position using physics-based movement."""
     
     def __init__(self, unit, target_position, callback=None):
         super().__init__(unit)
         self.target_position = target_position
         self.callback = callback  # Optional callback when movement is complete
-        self.arrival_threshold = 5.0  # Distance to consider "arrived"
+        self.arrival_threshold = self.unit.target_reached_threshold  # Use unit's threshold
     
     def update(self, dt):
+        """Update behavior state."""
         if not self.target_position:
             return True
         
-        # Calculate distance to target
-        dist = distance(self.unit.position, self.target_position)
+        # Use the standard movement logic
+        arrived = self._standardized_move_toward(self.target_position, dt)
         
-        # If we've arrived at the target
-        if dist < self.arrival_threshold:
+        # If we've arrived, complete the behavior
+        if arrived:
             if self.callback:
                 self.callback()
             return True
-        
-        # Calculate direction vector
-        dx = self.target_position[0] - self.unit.position[0]
-        dy = self.target_position[1] - self.unit.position[1]
-        
-        # Calculate base movement direction
-        direction = normalize((dx, dy))
-        
-        # Apply steering behaviors for better group movement
-        from game import Game
-        game_instance = Game.instance
-        
-        # Initialize steering vector
-        steer_x, steer_y = 0, 0
-        
-        if game_instance:
-            try:
-                # Add separation behavior - steer away from nearby units
-                separation_weight = 0.3
-                separation_radius = 20.0
-                
-                # Get other units - don't rely on selection state which can change
-                nearby_units = []
-                for entity in game_instance.entities:
-                    try:
-                        # Check if entity is a unit of same type and not self
-                        if (entity != self.unit and 
-                            isinstance(entity, type(self.unit)) and 
-                            hasattr(entity, 'position')):
-                            
-                            # Check if it's close enough to consider
-                            d = distance(self.unit.position, entity.position)
-                            if d < separation_radius:
-                                nearby_units.append((entity, d))
-                    except Exception:
-                        # Skip any problematic entities
-                        continue
-                
-                # Apply separation force from nearby units
-                if nearby_units:
-                    for entity, d in nearby_units:
-                        if d <= 0:  # Skip if somehow at exact same position
-                            continue
-                            
-                        # Get vector away from other unit
-                        away_x = self.unit.position[0] - entity.position[0]
-                        away_y = self.unit.position[1] - entity.position[1]
-                        
-                        # Normalize the away vector
-                        away_length = math.sqrt(away_x**2 + away_y**2)
-                        if away_length > 0:
-                            away_x /= away_length
-                            away_y /= away_length
-                            
-                            # Inverse square falloff - closer units push harder
-                            strength = (separation_radius - d) / separation_radius
-                            strength = strength * strength  # Square for stronger effect at close range
-                                
-                            # Apply weighted separation
-                            steer_x += away_x * strength * separation_weight
-                            steer_y += away_y * strength * separation_weight
-            except Exception:
-                # If any error occurs, just use basic movement
-                pass
-        
-        # Adjust final movement direction with steering forces
-        final_dx = direction[0] + steer_x
-        final_dy = direction[1] + steer_y
-        
-        # Make sure we have a non-zero direction
-        magnitude = math.sqrt(final_dx**2 + final_dy**2)
-        if magnitude < 0.001:  # Very small, essentially zero
-            final_dx = direction[0]  # Fall back to original direction
-            final_dy = direction[1]
-            magnitude = math.sqrt(final_dx**2 + final_dy**2)
-            if magnitude < 0.001:  # If still zero, use a default direction
-                final_dx = 1.0
-                final_dy = 0.0
-                magnitude = 1.0
-        
-        # Re-normalize the final direction
-        final_dx /= magnitude
-        final_dy /= magnitude
-        
-        # Calculate speed based on distance to target - slow down when approaching
-        speed_factor = 1.0
-        if dist < 50:  # Start slowing down when getting close
-            speed_factor = max(0.5, dist / 50)  # Scale between 0.5 and 1.0
             
-        # Move towards target with steering behaviors applied
-        self.unit.position[0] += final_dx * self.unit.speed * speed_factor * dt
-        self.unit.position[1] += final_dy * self.unit.speed * speed_factor * dt
-        
-        # Update angle to face movement direction
-        self.unit.angle = angle_between((0, 0), (final_dx, final_dy))
-        
         return False
     
     def is_finished(self):
+        """Check if we've reached the target."""
         if not self.target_position:
             return True
         
+        # Consider finished if very close and nearly stopped
         dist = distance(self.unit.position, self.target_position)
-        return dist < self.arrival_threshold
+        low_velocity = abs(self.unit.velocity[0]) < 2 and abs(self.unit.velocity[1]) < 2
+        
+        return dist < self.arrival_threshold * 0.5 and low_velocity
 
 class GatherBehavior(Behavior):
-    """Behavior for gathering resources."""
+    """Behavior for gathering resources using physics-based movement."""
     
     def __init__(self, unit, resource, command_center=None):
         super().__init__(unit)
         self.resource = resource
         self.command_center = command_center
-        self.stage = "moving_to_resource"  # Stages: moving_to_resource, gathering, returning, depositing
-        self.gather_timer = 0
-        self.deposit_timer = 0
-        self.assigned_slot = False  # Track if we've been assigned a mining slot
-        
-        # Find nearest command center if not provided
-        if not self.command_center:
-            self._find_nearest_command_center()
+        self.state = "MOVING_TO_RESOURCE"  # Initial state
+        self.force_scale = unit.steering_force * 0.8  # Slightly reduced force for gathering
+        self.arrival_threshold = unit.target_reached_threshold
+        self.gather_time = 0
+        self.gather_duration = ResourceConfig.HARVEST_TIME
+        self.deposit_time = 0
+        self.deposit_duration = ResourceConfig.DEPOSIT_TIME
+        self.slot_index = -1  # Will be assigned when getting to resource
     
     def update(self, dt):
-        from entities import Resource, CommandCenter  # Import here to avoid circular imports
-        
-        # Update any active timers
-        if self.gather_timer > 0:
-            self.gather_timer -= dt
-        if self.deposit_timer > 0:
-            self.deposit_timer -= dt
-        
-        # Validate targets - check if resource still exists or got removed
-        if not self.resource or not hasattr(self.resource, 'amount'):
-            print(f"Warning: Invalid resource for {self.unit}")
-            if self.assigned_slot:
-                # Try to release the slot before changing behavior
-                try:
-                    if hasattr(self.resource, 'release_worker_from_slot'):
-                        self.resource.release_worker_from_slot(self.unit)
-                except Exception:
-                    pass
-                self.assigned_slot = False
+        """Update the gather behavior state machine."""
+        try:
+            # Check if resource still exists
+            if not self.resource or (hasattr(self.resource, 'amount') and self.resource.amount <= 0):
+                # Try to find a new resource
+                new_resource = self._find_new_resource()
+                if new_resource:
+                    self.resource = new_resource
+                    self.state = "MOVING_TO_RESOURCE"
+                    self.slot_index = -1
+                else:
+                    # No resources left, return to idle
+                    return True
             
-            # Find a new resource or go idle
-            if not self._find_new_resource():
-                self.unit.current_behavior = behaviors.IdleBehavior(self.unit)
+            # State machine
+            if self.state == "MOVING_TO_RESOURCE":
+                return self._update_moving_to_resource(dt)
+            elif self.state == "GATHERING":
+                return self._update_gathering(dt)
+            elif self.state == "RETURNING":
+                return self._update_returning(dt)
+            elif self.state == "DEPOSITING":
+                return self._update_depositing(dt)
+            
+            return False
+        except Exception as e:
+            print(f"Error in GatherBehavior update: {e}")
             return True
+    
+    def _update_moving_to_resource(self, dt):
+        """Handle movement to the resource."""
+        # Try to get a harvest slot if we don't have one
+        if self.slot_index == -1:
+            self.slot_index = self.resource.get_available_slot()
+            
+            # If no slot is available, wait near the resource
+            if self.slot_index is None:
+                # Move to the resource and wait
+                self._move_toward_target(self.resource.position, dt)
+                return False
+            
+            # If we got a slot, register with the resource
+            self.resource.assign_worker_to_slot(self.unit, self.slot_index)
         
-        # If resource is depleted, try to find a new one
-        if self.resource.amount <= 0:
-            # Release slot
-            if self.assigned_slot:
-                try:
-                    self.resource.release_worker_from_slot(self.unit)
-                except Exception:
-                    pass
-                self.assigned_slot = False
-                
-            # Try to find a new resource
-            if not self._find_new_resource():
-                self.unit.current_behavior = behaviors.IdleBehavior(self.unit)
-            return True
+        # Calculate target position (slot position)
+        target_position = self.resource.get_slot_position(self.slot_index)
         
-        if not self.command_center:
-            self._find_nearest_command_center()
-            if not self.command_center:
-                print(f"Warning: No command center found for {self.unit}")
-                return True
+        # Move toward the slot position
+        dist = distance(self.unit.position, target_position)
         
-        # State machine for gathering behavior
-        if self.stage == "moving_to_resource":
-            self._update_moving_to_resource(dt)
-        elif self.stage == "gathering":
-            self._update_gathering(dt)
-        elif self.stage == "returning":
-            self._update_returning(dt)
-        elif self.stage == "depositing":
-            self._update_depositing(dt)
+        if dist < self.arrival_threshold:
+            # We've arrived, slow down
+            self.unit.velocity[0] *= 0.7
+            self.unit.velocity[1] *= 0.7
+            
+            # If nearly stopped, start gathering
+            if abs(self.unit.velocity[0]) < 5 and abs(self.unit.velocity[1]) < 5:
+                self.state = "GATHERING"
+                self.gather_time = 0
+        else:
+            # Keep moving toward slot
+            self._move_toward_target(target_position, dt)
+            
+            # Face the resource
+            dx = self.resource.position[0] - self.unit.position[0]
+            dy = self.resource.position[1] - self.unit.position[1]
+            self.unit.angle = angle_between((0, 0), (dx, dy))
         
         return False
     
-    def _update_moving_to_resource(self, dt):
-        """Move to the target resource."""
-        # Check if resource still exists and has resources
-        if not hasattr(self.resource, 'amount') or self.resource.amount <= 0:
-            self._find_new_resource()
-            return
-        
-        # Calculate distance to resource
-        dist = distance(self.unit.position, self.resource.position)
-        
-        # If close enough, start gathering
-        if dist <= self.unit.size + self.resource.size/2:
-            self.stage = "gathering"
-            self.gather_timer = 0.5  # Set initial gather timer
-            # We should already be in a slot from the Square.gather() method
-            self.assigned_slot = True
-            return
-        
-        # Get the target position - if we're assigned a slot, move to that specific position
-        target_pos = self.resource.position
-        if hasattr(self.resource, 'get_slot_position'):
-            # Try to find which slot we're assigned to
-            for i, worker in enumerate(self.resource.slots):
-                if worker == self.unit:
-                    # We found our slot, move directly to it
-                    target_pos = self.resource.get_slot_position(i)
-                    break
-        
-        # Move towards the target position
-        dx = target_pos[0] - self.unit.position[0]
-        dy = target_pos[1] - self.unit.position[1]
-        
-        # Calculate distance to target
-        dist_to_target = (dx*dx + dy*dy) ** 0.5
-        
-        # If we're very close to the target, snap to it
-        if dist_to_target < 5:
-            self.unit.position[0] = target_pos[0]
-            self.unit.position[1] = target_pos[1]
-            return
-        
-        # Normalize and apply speed
-        if dist_to_target > 0:  # Avoid division by zero
-            dx /= dist_to_target
-            dy /= dist_to_target
-        
-        # Move towards target with a small correction to prevent oscillation
-        approach_factor = min(1.0, dist_to_target / (self.unit.speed * dt))
-        
-        self.unit.position[0] += dx * self.unit.speed * dt * approach_factor
-        self.unit.position[1] += dy * self.unit.speed * dt * approach_factor
-        
-        # Update angle to face movement direction
-        self.unit.angle = angle_between((0, 0), (dx, dy))
-    
     def _update_gathering(self, dt):
-        """Gather resources from target."""
-        # Check if resource still exists and has resources
-        if not hasattr(self.resource, 'amount') or self.resource.amount <= 0:
-            # Release our slot before finding a new resource
-            if self.assigned_slot:
-                self.resource.release_worker_from_slot(self.unit)
-                self.assigned_slot = False
-            self._find_new_resource()
-            return
+        """Handle resource gathering."""
+        # Increment gather time
+        self.gather_time += dt
         
-        # If already full, return to base
-        if self.unit.carrying_resources >= self.unit.max_carry_capacity:
-            self.stage = "returning"
-            return
+        # Keep facing the resource
+        dx = self.resource.position[0] - self.unit.position[0]
+        dy = self.resource.position[1] - self.unit.position[1]
+        self.unit.angle = angle_between((0, 0), (dx, dy))
         
-        # If gather timer is done, collect resources
-        if self.gather_timer <= 0:
-            # Extract resources
-            gathered = self.resource.extract(1)
-            self.unit.carrying_resources += gathered
-            
-            # Set cooldown for next gather action
-            self.gather_timer = 0.5  # Gather every 0.5 seconds
-            
-            # Visual indication of gathering
+        # Show gathering effect
+        if random.random() < 0.1:  # Occasionally show effect
             self.unit.show_gather_effect = True
+            self.unit.effect_timer = 0
+        
+        # Check if we're done gathering
+        if self.gather_time >= self.gather_duration:
+            # Extract resources
+            gathered_amount = min(
+                self.unit.max_carry_capacity - self.unit.carrying_resources,
+                ResourceConfig.RESOURCE_GATHER_RATE
+            )
             
-            # If resource is depleted or we're full, return to base
-            if gathered == 0 or self.unit.carrying_resources >= self.unit.max_carry_capacity:
-                self.stage = "returning"
+            # Extract from resource if possible and resource has amount
+            if hasattr(self.resource, 'extract') and hasattr(self.resource, 'amount') and self.resource.amount > 0:
+                print(f"Extracting {gathered_amount} resources from {self.resource.amount} available")
+                gathered_amount = self.resource.extract(gathered_amount)
+                print(f"Extracted {gathered_amount}, now carrying {self.unit.carrying_resources + gathered_amount}")
+            else:
+                gathered_amount = 0
+                print("Resource not available for extraction")
+            
+            # Add to carried amount
+            self.unit.carrying_resources += gathered_amount
+            
+            # If we're full or resource is depleted, return to base
+            if (self.unit.carrying_resources >= self.unit.max_carry_capacity or
+                (hasattr(self.resource, 'amount') and self.resource.amount <= 0)):
+                # Release our slot
+                if self.slot_index != -1:
+                    self.resource.release_worker_from_slot(self.unit)
+                    self.slot_index = -1
+                
+                # Find a command center to return to
+                if not self.command_center:
+                    self.command_center = self._find_nearest_command_center()
+                
+                if self.command_center:
+                    print(f"Returning to command center with {self.unit.carrying_resources} resources")
+                    self.state = "RETURNING"
+                else:
+                    # No command center, keep gathering
+                    self.gather_time = 0
+            else:
+                # Continue gathering
+                self.gather_time = 0
+        
+        return False
     
     def _update_returning(self, dt):
-        """Return gathered resources to command center."""
-        # Calculate distance to command center
+        """Handle returning to command center."""
+        # Check if command center still exists
+        if not self.command_center or (hasattr(self.command_center, 'health') and self.command_center.health <= 0):
+            # Find a new command center
+            self.command_center = self._find_nearest_command_center()
+            if not self.command_center:
+                # No command center to return to - go back to gathering
+                self.state = "MOVING_TO_RESOURCE"
+                return False
+        
+        # Move toward command center
         dist = distance(self.unit.position, self.command_center.position)
         
-        # If close enough, start depositing
-        if dist <= self.unit.size + self.command_center.size/2:
-            self.stage = "depositing"
-            self.deposit_timer = 0.3  # Set initial deposit timer
-            return
+        # Use a larger threshold for command centers since they're bigger
+        command_center_threshold = self.arrival_threshold + self.command_center.size / 2
         
-        # Move towards command center
-        dx = self.command_center.position[0] - self.unit.position[0]
-        dy = self.command_center.position[1] - self.unit.position[1]
+        if dist < command_center_threshold:
+            # We've arrived, slow down
+            self.unit.velocity[0] *= 0.7
+            self.unit.velocity[1] *= 0.7
+            
+            # If nearly stopped or close enough, start depositing
+            if abs(self.unit.velocity[0]) < 5 and abs(self.unit.velocity[1]) < 5 or dist < command_center_threshold * 0.7:
+                print(f"Starting deposit at distance {dist} from command center")
+                self.state = "DEPOSITING"
+                self.deposit_time = 0
+        else:
+            # Keep moving toward command center
+            self._move_toward_target(self.command_center.position, dt)
+            
+            # Face the command center
+            dx = self.command_center.position[0] - self.unit.position[0]
+            dy = self.command_center.position[1] - self.unit.position[1]
+            self.unit.angle = angle_between((0, 0), (dx, dy))
         
-        # Calculate distance to target
-        dist_to_target = (dx*dx + dy*dy) ** 0.5
-        
-        # Normalize and apply speed
-        if dist_to_target > 0:  # Avoid division by zero
-            dx /= dist_to_target
-            dy /= dist_to_target
-        
-        # Move towards target with a small correction to prevent oscillation
-        approach_factor = min(1.0, dist_to_target / (self.unit.speed * dt))
-        
-        self.unit.position[0] += dx * self.unit.speed * dt * approach_factor
-        self.unit.position[1] += dy * self.unit.speed * dt * approach_factor
-        
-        # Update angle to face movement direction
-        self.unit.angle = angle_between((0, 0), (dx, dy))
+        return False
     
     def _update_depositing(self, dt):
-        """Deposit resources at the command center."""
-        # If deposit timer is done, deposit resources
-        if self.deposit_timer <= 0:
+        """Handle depositing resources at command center."""
+        # Increment deposit time
+        self.deposit_time += dt
+        
+        # Keep facing the command center
+        dx = self.command_center.position[0] - self.unit.position[0]
+        dy = self.command_center.position[1] - self.unit.position[1]
+        self.unit.angle = angle_between((0, 0), (dx, dy))
+        
+        # Check if we're done depositing
+        if self.deposit_time >= self.deposit_duration:
             # Deposit resources
-            from game import Game  # Import here to avoid circular import
+            amount_to_deposit = self.unit.carrying_resources
+            if hasattr(self.command_center, 'add_resources') and amount_to_deposit > 0:
+                print(f"Depositing {amount_to_deposit} resources at command center")
+                self.command_center.add_resources(amount_to_deposit)
+                
+                # Get game instance to verify resources were added
+                from game import Game
+                if Game.instance:
+                    player_id = self.unit.player_id
+                    print(f"Player {player_id} now has {Game.instance.resources[player_id]} resources")
             
-            # Debug message
-            if Game.instance.show_debug:
-                print(f"Worker depositing {self.unit.carrying_resources} resources at command center")
-            
-            self.command_center.add_resources(self.unit.carrying_resources)
+            # Reset carrying amount
             self.unit.carrying_resources = 0
             
-            # Check if original resource still has minerals
-            if hasattr(self.resource, 'amount') and self.resource.amount > 0:
-                # Go back to the same resource
-                self.stage = "moving_to_resource"
-            else:
-                # Release our slot before finding a new resource
-                if self.assigned_slot:
-                    self.resource.release_worker_from_slot(self.unit)
-                    self.assigned_slot = False
-                # Find a new resource
-                self._find_new_resource()
+            # Return to resource
+            self.state = "MOVING_TO_RESOURCE"
+        
+        return False
     
     def _find_nearest_command_center(self):
-        """Find the nearest command center belonging to this unit's player."""
-        from game import Game  # Import here to avoid circular import
+        """Find the nearest command center belonging to the same player."""
         from entities import CommandCenter
+        from game import Game
         
+        # Find all command centers for this player
         command_centers = [e for e in Game.instance.entities 
-                          if isinstance(e, CommandCenter) and e.player_id == self.unit.player_id]
+                         if isinstance(e, CommandCenter) and e.player_id == self.unit.player_id]
         
         if command_centers:
-            self.command_center = min(command_centers, 
-                                     key=lambda cc: distance(self.unit.position, cc.position))
-        else:
-            self.command_center = None
+            # Return closest one
+            return min(command_centers, 
+                     key=lambda cc: distance(self.unit.position, cc.position))
+        return None
     
     def _find_new_resource(self):
         """Find a new resource to gather from."""
-        from game import Game  # Import here to avoid circular import
         from entities import Resource
+        from game import Game
         
+        # Find all resources that aren't depleted
         resources = [e for e in Game.instance.entities 
-                    if isinstance(e, Resource) and e.amount > 0]
+                   if isinstance(e, Resource) and hasattr(e, 'amount') and e.amount > 0]
         
         if resources:
-            self.resource = min(resources, key=lambda r: distance(self.unit.position, r.position))
-            # Need to get assigned a new slot
-            slot_position = self.resource.assign_harvest_slot(self.unit)
-            if slot_position is not None:
-                self.assigned_slot = True
-                self.unit.position = list(slot_position)  # Snap to the slot position
-            self.stage = "moving_to_resource"
-        else:
-            # No resources available, become idle
-            self.resource = None
-            self.stage = "idle"
-            return True
-            
+            # Return closest one
+            return min(resources, 
+                     key=lambda r: distance(self.unit.position, r.position))
+        return None
+    
+    def _move_toward_target(self, target_position, dt):
+        """Apply force to move toward target position."""
+        return self._standardized_move_toward(target_position, dt, force_scale=self.force_scale)
+    
     def exit(self):
-        """Clean up when behavior is finished."""
-        # Release our slot when we're done
-        if self.assigned_slot and self.resource:
+        """Clean up when this behavior ends."""
+        # Release slot if we have one
+        if self.resource and self.slot_index != -1:
             self.resource.release_worker_from_slot(self.unit)
-            self.assigned_slot = False
 
 class AttackBehavior(Behavior):
-    """Behavior for attacking a target."""
+    """Behavior for attacking a target with physics-based movement."""
     
     def __init__(self, unit, target):
         super().__init__(unit)
         self.target = target
         self.in_range = False
         self.chase_range = unit.aggro_range  # Use the unit's aggro range for chasing
+        self.force_scale = unit.steering_force * 0.8  # Slightly reduced force for better control
+        self.approach_complete = False  # Flag for when we've approached the target
+        
+        # Determine attack type based on unit
+        from entities import Dot
+        self.is_melee = isinstance(unit, Dot)  # Dots are melee units
     
     def update(self, dt):
         try:
-            # Check if target is still valid - different check for buildings vs units
-            from entities import Building, Dot
+            # Check if target is still valid
+            from entities import Building
             
             if not self.target:
-                print("Target is None")
                 return True
                 
-            # Buildings don't have the same properties as units, handle them differently
-            is_building_target = isinstance(self.target, Building)
-            
-            # Adjust attack range for dot units attacking buildings
-            original_attack_range = self.unit.attack_range
-            if isinstance(self.unit, Dot) and is_building_target:
-                # Double the attack range for dots attacking buildings (much bigger increase)
-                print(f"Dot attacking building: Increasing range from {self.unit.attack_range} to {self.unit.attack_range * 2}")
-                self.unit.attack_range = self.unit.attack_range * 2  # Double the range
-                
-                # Also make the log message clearer
-                print(f"Dot with attack range {self.unit.attack_range} targeting building at distance {distance(self.unit.position, self.target.position)}")
-            
-            if is_building_target:
-                # For buildings, just check if they have health
-                if not hasattr(self.target, 'health') or self.target.health <= 0:
-                    print(f"Building target invalid: health={self.target.health if hasattr(self.target, 'health') else 'no health'}")
-                    # Restore original attack range
-                    self.unit.attack_range = original_attack_range
-                    return True
-            else:
-                # For other entities, check standard properties
-                if not hasattr(self.target, 'health') or self.target.health <= 0:
-                    print(f"Target invalid: health={self.target.health if hasattr(self.target, 'health') else 'no health'}")
-                    # Restore original attack range
-                    self.unit.attack_range = original_attack_range
-                    return True
+            # Check if target is still alive
+            if not hasattr(self.target, 'health') or self.target.health <= 0:
+                return True
             
             # Update attack cooldown
             if self.unit.attack_cooldown > 0:
@@ -474,82 +417,106 @@ class AttackBehavior(Behavior):
             
             # If target moved out of chase range, stop attacking
             if dist > self.chase_range:
-                print(f"Target out of chase range: {dist} > {self.chase_range}")
-                # Restore original attack range
-                self.unit.attack_range = original_attack_range
                 return True
             
-            # If not in attack range, move towards target
-            if dist > self.unit.attack_range:
-                # Move towards target
+            # Handle movement based on attack type
+            if self.is_melee:
+                # Melee units need to get close to the target
+                # When in range, they'll deal damage through collision in _handle_collisions
+                if dist > self.unit.size:  # Need to be touching target
+                    # Apply force toward target
+                    self._move_toward_target(dt)
+                    self.in_range = False
+                else:
+                    # We're in melee range, slow down
+                    self.unit.velocity[0] *= 0.8
+                    self.unit.velocity[1] *= 0.8
+                    self.in_range = True
+            else:
+                # Ranged units should maintain distance
+                if dist > self.unit.attack_range:
+                    # Move toward target
+                    self._move_toward_target(dt)
+                    self.in_range = False
+                else:
+                    # In range, apply a smaller force to maintain position
+                    self._maintain_attack_position(dt)
+                    self.in_range = True
+                    
+                    # Fire if cooldown is ready
+                    if self.unit.attack_cooldown <= 0:
+                        self._fire_ranged_attack()
+            
+            # Update angle to face target
+            if self.target:
                 dx = self.target.position[0] - self.unit.position[0]
                 dy = self.target.position[1] - self.unit.position[1]
-                
-                # Normalize and apply speed
-                direction = normalize((dx, dy))
-                
-                # Move towards target
-                self.unit.position[0] += direction[0] * self.unit.speed * dt
-                self.unit.position[1] += direction[1] * self.unit.speed * dt
-                
-                # Update angle to face movement direction
-                self.unit.angle = angle_between((0, 0), direction)
-                
-                self.in_range = False
-            else:
-                # In range, attack if cooldown is ready
-                self.in_range = True
-                print(f"In attack range: {dist} <= {self.unit.attack_range}, cooldown: {self.unit.attack_cooldown}")
-                
-                if self.unit.attack_cooldown <= 0:
-                    try:
-                        target_type = type(self.target).__name__
-                        print(f"Attacking target: {target_type}, has_take_damage={hasattr(self.target, 'take_damage')}")
-                        
-                        # Attack target - check if target has take_damage method first
-                        if hasattr(self.target, 'take_damage'):
-                            # Apply damage and check if destroyed
-                            damage = self.unit.attack_damage
-                            print(f"Applying {damage} damage to {target_type} with {self.target.health} health")
-                            
-                            # Apply damage
-                            target_destroyed = self.target.take_damage(damage)
-                            print(f"After attack: target health = {self.target.health}, destroyed = {target_destroyed}")
-                        else:
-                            # Legacy fallback - directly modify health
-                            self.target.health -= self.unit.attack_damage
-                            target_destroyed = self.target.health <= 0
-                        
-                        # Reset attack cooldown
-                        self.unit.attack_cooldown = self.unit.attack_cooldown_max
-                        
-                        # Show attack effect
-                        self.unit.show_attack_effect = True
-                        
-                        # If target was destroyed
-                        if target_destroyed or self.target.health <= 0:
-                            print(f"Target destroyed")
-                            # Restore original attack range
-                            self.unit.attack_range = original_attack_range
-                            return True
-                    except Exception as e:
-                        print(f"Error during attack: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # If attack fails, consider behavior complete
-                        # Restore original attack range
-                        self.unit.attack_range = original_attack_range
-                        return True
+                self.unit.angle = angle_between((0, 0), (dx, dy))
             
-            # Restore original attack range at the end of the update
-            self.unit.attack_range = original_attack_range
             return False
+            
         except Exception as e:
             print(f"Error in AttackBehavior: {e}")
-            # Make sure to restore the original attack range on error
-            if hasattr(self, 'unit') and hasattr(self.unit, 'attack_range') and 'original_attack_range' in locals():
-                self.unit.attack_range = original_attack_range
             return True
+    
+    def _move_toward_target(self, dt):
+        """Move toward the attack target."""
+        if not self.target:
+            return
+            
+        return self._standardized_move_toward(self.target.position, dt)
+    
+    def _maintain_attack_position(self, dt):
+        """Apply forces to maintain optimal attack position."""
+        if not self.target:
+            return
+            
+        # Calculate direction vector to target
+        dx = self.target.position[0] - self.unit.position[0]
+        dy = self.target.position[1] - self.unit.position[1]
+        dist = math.sqrt(dx*dx + dy*dy)
+        
+        if dist > 0:
+            # Calculate optimal attack distance (75% of attack range)
+            optimal_dist = self.unit.attack_range * 0.75
+            
+            # Determine if we need to move closer or further
+            distance_factor = (dist - optimal_dist) / optimal_dist
+            
+            # Apply a weak force to maintain distance
+            if abs(distance_factor) > 0.1:  # Only adjust if needed
+                # Normalize direction
+                dir_x = dx / dist
+                dir_y = dy / dist
+                
+                # Scale force based on how far we are from optimal position
+                force_scale = min(self.force_scale * 0.5, self.force_scale * abs(distance_factor))
+                
+                # Move toward or away from target
+                if distance_factor < 0:  # Too close
+                    self.unit.apply_force(-dir_x * force_scale, -dir_y * force_scale)
+                else:  # Too far
+                    self.unit.apply_force(dir_x * force_scale, dir_y * force_scale)
+            
+            # Apply a small damping to velocity to avoid orbiting
+            self.unit.velocity[0] *= 0.95
+            self.unit.velocity[1] *= 0.95
+    
+    def _fire_ranged_attack(self):
+        """Fire a ranged attack at the target."""
+        if not self.target or not hasattr(self.target, 'take_damage'):
+            return
+            
+        # Apply damage to target
+        damage = self.unit.attack_damage
+        self.target.take_damage(damage)
+        
+        # Reset attack cooldown
+        self.unit.attack_cooldown = self.unit.attack_cooldown_max
+        
+        # Show attack effect
+        self.unit.show_attack_effect = True
+        self.unit.effect_timer = 0
     
     def is_finished(self):
         return not self.target or not hasattr(self.target, 'health') or self.target.health <= 0
@@ -559,76 +526,150 @@ class AttackBehavior(Behavior):
         pass
 
 class HoldPositionBehavior(Behavior):
-    """Behavior for holding position and only attacking when enemies approach attack range."""
+    """Behavior for holding position and attacking enemies in range."""
     
     def __init__(self, unit):
         super().__init__(unit)
-        self.original_position = tuple(unit.position)
-        self.detection_range = unit.aggro_range  # Use aggro range to detect enemies
-        self.target = None
-        self.hold_strict = True  # Strict hold means don't move to chase enemies
+        # Store the position to hold
+        self.hold_position = list(unit.position)
+        self.check_enemies_timer = 0
+        self.check_enemies_interval = 0.3  # How often to check for enemies
+        self.attacking_target = None
+        self.position_threshold = 20.0  # How far unit can drift from hold position
     
     def update(self, dt):
+        # First apply a damping force to slow down
+        self.unit.velocity[0] *= 0.9
+        self.unit.velocity[1] *= 0.9
+        
+        # Check if we've drifted too far from hold position
+        dist_from_hold = distance(self.unit.position, self.hold_position)
+        if dist_from_hold > self.position_threshold:
+            # Apply force to move back to hold position
+            self._return_to_position(dt)
+        
+        # Check for enemies to attack
+        self.check_enemies_timer += dt
+        if self.check_enemies_timer >= self.check_enemies_interval:
+            self.check_enemies_timer = 0
+            
+            # If we have a target, check if it's still valid
+            if self.attacking_target:
+                if (not hasattr(self.attacking_target, 'health') or 
+                    self.attacking_target.health <= 0 or
+                    distance(self.unit.position, self.attacking_target.position) > self.unit.aggro_range):
+                    self.attacking_target = None
+            
+            # If no target, look for a new one
+            if not self.attacking_target:
+                self.attacking_target = self._find_nearest_enemy()
+        
+        # Attack the target if we have one
+        if self.attacking_target:
+            # Update attack cooldown
+            if self.unit.attack_cooldown > 0:
+                self.unit.attack_cooldown -= dt
+            
+            # Calculate distance to target
+            target_dist = distance(self.unit.position, self.attacking_target.position)
+            
+            # Determine if we're in attack range
+            from entities import Dot
+            is_melee = isinstance(self.unit, Dot)
+            
+            if is_melee:
+                # Melee units need to be close to target
+                if target_dist <= self.unit.size:
+                    # In melee range, deliver damage
+                    if self.unit.attack_cooldown <= 0:
+                        self._apply_melee_damage(self.attacking_target)
+                else:
+                    # Only move slightly from hold position if needed
+                    max_move_dist = min(self.position_threshold * 0.8, target_dist * 0.5)
+                    if target_dist < self.unit.aggro_range * 0.5:  # Only chase if fairly close
+                        self._move_slightly_toward(self.attacking_target.position, max_move_dist, dt)
+            else:
+                # Ranged units attack from distance
+                if target_dist <= self.unit.attack_range:
+                    # In range, attack
+                    if self.unit.attack_cooldown <= 0:
+                        self._fire_ranged_attack(self.attacking_target)
+            
+            # Face the target
+            dx = self.attacking_target.position[0] - self.unit.position[0]
+            dy = self.attacking_target.position[1] - self.unit.position[1]
+            if dx != 0 or dy != 0:
+                self.unit.angle = angle_between((0, 0), (dx, dy))
+        
+        return False
+    
+    def _return_to_position(self, dt):
+        """Return to original hold position if pushed away."""
+        if distance(self.unit.position, self.hold_position) > self.position_threshold:
+            # Use standardized movement to return to position
+            self._standardized_move_toward(self.hold_position, dt, force_scale=self.unit.steering_force * 0.3)
+    
+    def _move_slightly_toward(self, target_position, max_dist, dt):
+        """Move slightly toward a target without going too far from hold position."""
+        # Calculate vector to target
+        dx = target_position[0] - self.unit.position[0]
+        dy = target_position[1] - self.unit.position[1]
+        dist = math.sqrt(dx*dx + dy*dy)
+        
+        # Only move if in range
+        if dist > 0 and dist < max_dist:
+            # Calculate limited movement target - don't go too far from hold position
+            limit_dist = min(dist, max_dist * 0.5)
+            limited_target = [
+                self.unit.position[0] + (dx / dist) * limit_dist,
+                self.unit.position[1] + (dy / dist) * limit_dist
+            ]
+            
+            # Use standardized movement with reduced force
+            self._standardized_move_toward(limited_target, dt, force_scale=self.unit.steering_force * 0.2)
+    
+    def _find_nearest_enemy(self):
+        """Find the nearest enemy within aggro range."""
+        if self.unit.attack_damage <= 0:
+            return None
+            
         # Import here to avoid circular imports
         from game import Game
         
-        # If we have an active target, attack it if in range
-        if self.target:
-            # Check if target is still valid
-            if not hasattr(self.target, 'health') or self.target.health <= 0:
-                self.target = None
-            else:
-                # Calculate distance to target
-                target_dist = distance(self.unit.position, self.target.position)
+        # Look for enemies in aggro range
+        enemies = []
+        for entity in Game.instance.entities:
+            if (hasattr(entity, 'player_id') and entity.player_id != self.unit.player_id and
+                hasattr(entity, 'health') and entity.health > 0):
                 
-                # If target moved out of detection range, stop tracking it
-                if target_dist > self.detection_range:
-                    self.target = None
-                elif target_dist <= self.unit.attack_range:
-                    # Target is in attack range, attack it
-                    if self.unit.attack_cooldown > 0:
-                        self.unit.attack_cooldown -= dt
-                    
-                    if self.unit.attack_cooldown <= 0:
-                        # Attack
-                        self.target.health -= self.unit.attack_damage
-                        self.unit.attack_cooldown = self.unit.attack_cooldown_max
-                        self.unit.show_attack_effect = True
-                        
-                        # If target was destroyed
-                        if self.target.health <= 0:
-                            self.target = None
-                else:
-                    # Target is detected but not in attack range
-                    # In strict hold mode, unit doesn't move but keeps tracking the target
-                    pass
+                dist = distance(self.unit.position, entity.position)
+                if dist <= self.unit.aggro_range:
+                    enemies.append((entity, dist))
         
-        # No target, scan for enemies in detection range
-        else:
-            # Look for enemies in detection range
-            enemies = [e for e in Game.instance.entities 
-                      if hasattr(e, 'player_id') and e.player_id != self.unit.player_id
-                      and hasattr(e, 'health') and e.health > 0]
-            
-            # Find closest enemy in detection range
-            enemies_in_range = []
-            for enemy in enemies:
-                if distance(self.unit.position, enemy.position) <= self.detection_range:
-                    enemies_in_range.append(enemy)
-            
-            if enemies_in_range:
-                # Target closest enemy
-                self.target = min(enemies_in_range, 
-                                 key=lambda e: distance(self.unit.position, e.position))
+        # Sort by distance
+        if enemies:
+            enemies.sort(key=lambda x: x[1])
+            return enemies[0][0]
         
-        # Always ensure unit stays at original position in strict hold mode
-        if self.hold_strict:
-            # Only snap back if drifted significantly
-            current_pos_dist = distance(self.unit.position, self.original_position)
-            if current_pos_dist > 5:
-                self.unit.position = list(self.original_position)
-        
-        return False
+        return None
+    
+    def _apply_melee_damage(self, target):
+        """Apply melee damage to target."""
+        if hasattr(target, 'take_damage') and self.unit.attack_cooldown <= 0:
+            damage = self.unit.attack_damage
+            target.take_damage(damage)
+            self.unit.attack_cooldown = self.unit.attack_cooldown_max
+            self.unit.show_attack_effect = True
+            self.unit.effect_timer = 0
+    
+    def _fire_ranged_attack(self, target):
+        """Fire a ranged attack at the target."""
+        if hasattr(target, 'take_damage'):
+            damage = self.unit.attack_damage
+            target.take_damage(damage)
+            self.unit.attack_cooldown = self.unit.attack_cooldown_max
+            self.unit.show_attack_effect = True
+            self.unit.effect_timer = 0
     
     def is_finished(self):
         # Hold position behavior only ends when explicitly changed
@@ -640,150 +681,287 @@ class AttackMoveBehavior(Behavior):
     def __init__(self, unit, target_position):
         super().__init__(unit)
         self.target_position = target_position
-        self.move_behavior = MoveBehavior(unit, target_position)
-        self.current_target = None
-        self.detection_range = unit.aggro_range  # Use the unit's aggro range for detection
+        self.force_scale = unit.steering_force * 0.8  # Slightly reduced force for attack-move
+        self.arrival_threshold = unit.target_reached_threshold
+        self.check_enemies_timer = 0
+        self.check_enemies_interval = 0.4  # How often to check for enemies
+        self.attacking_target = None
+        
+        # Determine attack type based on unit
+        from entities import Dot
+        self.is_melee = isinstance(unit, Dot)  # Dots are melee units
     
     def update(self, dt):
-        from game import Game
-        
-        # If we have a target, attack it
-        if self.current_target:
-            # Check if target is still valid
-            if not hasattr(self.current_target, 'health') or self.current_target.health <= 0:
-                self.current_target = None
-            else:
-                # Calculate distance to target
-                target_dist = distance(self.unit.position, self.current_target.position)
-                
-                # If target moved out of detection range, stop attacking and continue moving
-                if target_dist > self.detection_range:
-                    self.current_target = None
-                # If target is in attack range, attack it
-                elif target_dist <= self.unit.attack_range:
-                    if self.unit.attack_cooldown > 0:
-                        self.unit.attack_cooldown -= dt
-                    
-                    if self.unit.attack_cooldown <= 0:
-                        # Attack
-                        self.current_target.health -= self.unit.attack_damage
-                        self.unit.attack_cooldown = self.unit.attack_cooldown_max
-                        self.unit.show_attack_effect = True
-                        
-                        # If target was destroyed
-                        if self.current_target.health <= 0:
-                            self.current_target = None
-                else:
-                    # Move towards the target
-                    dx = self.current_target.position[0] - self.unit.position[0]
-                    dy = self.current_target.position[1] - self.unit.position[1]
-                    
-                    # Normalize and apply speed
-                    direction = normalize((dx, dy))
-                    
-                    # Move towards target
-                    self.unit.position[0] += direction[0] * self.unit.speed * dt
-                    self.unit.position[1] += direction[1] * self.unit.speed * dt
-                    
-                    # Update angle to face movement direction
-                    self.unit.angle = angle_between((0, 0), direction)
-        
-        # No target, continue moving and scan for enemies
-        else:
-            # Check if we've arrived at destination
-            dist_to_target = distance(self.unit.position, self.target_position)
-            if dist_to_target < 5:
+        # Check if we've arrived at the destination
+        if distance(self.unit.position, self.target_position) < self.arrival_threshold:
+            # Slow down as we approach
+            self.unit.velocity[0] *= 0.8
+            self.unit.velocity[1] *= 0.8
+            
+            # If nearly stopped, consider arrived
+            if abs(self.unit.velocity[0]) < 5 and abs(self.unit.velocity[1]) < 5:
                 return True
+        
+        # Check for enemies
+        self.check_enemies_timer += dt
+        if self.check_enemies_timer >= self.check_enemies_interval:
+            self.check_enemies_timer = 0
             
-            # Look for enemies in detection range
-            enemies = [e for e in Game.instance.entities 
-                      if hasattr(e, 'player_id') and e.player_id != self.unit.player_id
-                      and hasattr(e, 'health') and e.health > 0]
+            # Check if current target is still valid
+            if self.attacking_target:
+                if (not hasattr(self.attacking_target, 'health') or 
+                    self.attacking_target.health <= 0 or
+                    distance(self.unit.position, self.attacking_target.position) > self.unit.aggro_range):
+                    self.attacking_target = None
             
-            # Find closest enemy in detection range
-            enemies_in_range = []
-            for enemy in enemies:
-                if distance(self.unit.position, enemy.position) <= self.detection_range:
-                    enemies_in_range.append(enemy)
+            # If no target, check for new enemies
+            if not self.attacking_target:
+                self.attacking_target = self._find_nearest_enemy()
+        
+        # Handle attack or movement
+        if self.attacking_target:
+            # Update attack cooldown
+            if self.unit.attack_cooldown > 0:
+                self.unit.attack_cooldown -= dt
             
-            if enemies_in_range:
-                # Target closest enemy
-                self.current_target = min(enemies_in_range, 
-                                         key=lambda e: distance(self.unit.position, e.position))
+            target_dist = distance(self.unit.position, self.attacking_target.position)
+            
+            if self.is_melee:
+                # For melee units, move toward target
+                if target_dist > self.unit.size:
+                    self._move_toward_target(self.attacking_target.position, dt)
+                else:
+                    # In melee range, slow down
+                    self.unit.velocity[0] *= 0.8
+                    self.unit.velocity[1] *= 0.8
+                    
+                    # Deal damage if cooldown ready
+                    if self.unit.attack_cooldown <= 0:
+                        self._apply_melee_damage(self.attacking_target)
             else:
-                # No enemies, continue moving
-                self.move_behavior.update(dt)
+                # For ranged units
+                if target_dist <= self.unit.attack_range:
+                    # In range for attack, slow down
+                    self.unit.velocity[0] *= 0.9
+                    self.unit.velocity[1] *= 0.9
+                    
+                    # Attack if cooldown ready
+                    if self.unit.attack_cooldown <= 0:
+                        self._fire_ranged_attack(self.attacking_target)
+                else:
+                    # Need to move closer
+                    self._move_toward_target(self.attacking_target.position, dt)
+            
+            # Face the target
+            dx = self.attacking_target.position[0] - self.unit.position[0]
+            dy = self.attacking_target.position[1] - self.unit.position[1]
+            if dx != 0 or dy != 0:
+                self.unit.angle = angle_between((0, 0), (dx, dy))
+        else:
+            # No enemies, continue moving toward destination
+            self._move_toward_target(self.target_position, dt)
         
         return False
     
+    def _move_toward_target(self, target_position, dt):
+        """Apply force to move toward target position."""
+        return self._standardized_move_toward(target_position, dt, force_scale=self.force_scale)
+    
+    def _find_nearest_enemy(self):
+        """Find the nearest enemy within aggro range."""
+        if self.unit.attack_damage <= 0:
+            return None
+            
+        # Import here to avoid circular imports
+        from game import Game
+        
+        # Look for enemies in aggro range
+        enemies = []
+        for entity in Game.instance.entities:
+            if (hasattr(entity, 'player_id') and entity.player_id != self.unit.player_id and
+                hasattr(entity, 'health') and entity.health > 0):
+                
+                dist = distance(self.unit.position, entity.position)
+                if dist <= self.unit.aggro_range:
+                    enemies.append((entity, dist))
+        
+        # Sort by distance
+        if enemies:
+            enemies.sort(key=lambda x: x[1])
+            return enemies[0][0]
+        
+        return None
+    
+    def _apply_melee_damage(self, target):
+        """Apply melee damage to target."""
+        if hasattr(target, 'take_damage'):
+            damage = self.unit.attack_damage
+            target.take_damage(damage)
+            self.unit.attack_cooldown = self.unit.attack_cooldown_max
+            self.unit.show_attack_effect = True
+            self.unit.effect_timer = 0
+    
+    def _fire_ranged_attack(self, target):
+        """Fire a ranged attack at the target."""
+        if hasattr(target, 'take_damage'):
+            damage = self.unit.attack_damage
+            target.take_damage(damage)
+            self.unit.attack_cooldown = self.unit.attack_cooldown_max
+            self.unit.show_attack_effect = True
+            self.unit.effect_timer = 0
+    
     def is_finished(self):
-        # Check if we've arrived at destination with no enemies
-        if not self.current_target:
-            return self.move_behavior.is_finished()
-        return False 
+        """Check if we've arrived at destination with no enemies."""
+        # If we've reached the target position and aren't attacking anything
+        if distance(self.unit.position, self.target_position) < self.arrival_threshold and not self.attacking_target:
+            return True
+        return False
 
 class PatrolBehavior(Behavior):
-    """Behavior for patrolling between two points."""
+    """Behavior for patrolling between two points with physics-based movement."""
     
     def __init__(self, unit, start_position, end_position):
-        """Initialize patrol behavior.
-        
-        Args:
-            unit: The unit to control
-            start_position: Starting patrol point
-            end_position: Ending patrol point
-        """
         super().__init__(unit)
-        # Fix: Convert to list if needed to safely copy
-        self.start_position = list(start_position) if isinstance(start_position, tuple) else start_position.copy()
-        self.end_position = list(end_position) if isinstance(end_position, tuple) else end_position.copy()
-        self.current_target = self.end_position  # First move to the end
-        self.move_behavior = MoveBehavior(unit, self.current_target)
-        self.is_patrolling = True
+        self.start_position = list(start_position)  # Make a copy
+        self.end_position = list(end_position)     # Make a copy
+        self.current_target = list(end_position)   # Start by moving to end position
+        self.moving_to_end = True                  # Direction flag
+        self.force_scale = unit.steering_force * 0.9  # Slightly reduced force for patrol
+        self.arrival_threshold = unit.target_reached_threshold * 1.5  # Larger threshold for patrol points
         
-        # Keep track of enemies encountered during patrol
-        self.checking_for_enemies = True
-        print(f"Unit {type(unit).__name__} patrolling between {self.start_position} and {self.end_position}")
+        # Attack properties
+        self.chase_range = unit.aggro_range
+        self.check_enemies_timer = 0
+        self.check_enemies_interval = 0.5  # How often to check for enemies
+        self.attacking_target = None
     
     def update(self, dt):
-        """Update patrol behavior."""
-        # Check for enemies in aggro range while patrolling
-        if self.checking_for_enemies and self.unit.aggro_range > 0:
-            try:
-                # Find enemy entities
-                game_instance = get_game_instance()
-                if game_instance:
-                    for entity in game_instance.entities:
-                        if (hasattr(entity, 'player_id') and entity.player_id != self.unit.player_id and 
-                            hasattr(entity, 'health') and entity.health > 0):
-                            
-                            dist = distance(self.unit.position, entity.position)
-                            
-                            # If enemy is in aggro range, attack it
-                            if dist <= self.unit.aggro_range:
-                                print(f"Patrol unit {type(self.unit).__name__} found enemy at distance {dist:.1f}")
-                                self.unit.attack(entity)
-                                return True  # End patrol to attack
-            except Exception as e:
-                print(f"Error checking for enemies during patrol: {e}")
-        
-        # Update the move behavior
-        finished = self.move_behavior.update(dt)
-        
-        # If reached the current target, switch to the other target
-        if finished:
-            # Swap targets
-            if self.current_target == self.end_position:
-                self.current_target = self.start_position
-            else:
-                self.current_target = self.end_position
+        # First, check for and handle enemies
+        self.check_enemies_timer += dt
+        if self.check_enemies_timer >= self.check_enemies_interval:
+            self.check_enemies_timer = 0
+            enemy = self._check_for_enemies()
+            if enemy:
+                # If we found an enemy, attack it
+                self.attacking_target = enemy
                 
-            # Create a new movement behavior for the new target
-            self.move_behavior = MoveBehavior(self.unit, self.current_target)
-            print(f"Patrol: Unit {type(self.unit).__name__} changing direction")
+                # We'll keep track of the patrol state, but switch to attack mode
+                from entities import Dot
+                if isinstance(self.unit, Dot):
+                    # For melee units, we need to get close
+                    self._move_toward_target(self.attacking_target.position, dt)
+                    
+                    # Deal damage if close enough
+                    if distance(self.unit.position, self.attacking_target.position) <= self.unit.size and self.unit.attack_cooldown <= 0:
+                        self._apply_melee_damage(self.attacking_target)
+                else:
+                    # For ranged units
+                    if distance(self.unit.position, self.attacking_target.position) <= self.unit.attack_range:
+                        # In range, slow down and attack
+                        self.unit.velocity[0] *= 0.9
+                        self.unit.velocity[1] *= 0.9
+                        
+                        if self.unit.attack_cooldown <= 0:
+                            self._fire_ranged_attack(self.attacking_target)
+                    else:
+                        # Move towards enemy
+                        self._move_toward_target(self.attacking_target.position, dt)
+                
+                # Update attack cooldown
+                if self.unit.attack_cooldown > 0:
+                    self.unit.attack_cooldown -= dt
+                
+                # Update angle to face target
+                dx = self.attacking_target.position[0] - self.unit.position[0]
+                dy = self.attacking_target.position[1] - self.unit.position[1]
+                self.unit.angle = angle_between((0, 0), (dx, dy))
+                
+                # Check if target is dead or out of range
+                if (not hasattr(self.attacking_target, 'health') or 
+                    self.attacking_target.health <= 0 or
+                    distance(self.unit.position, self.attacking_target.position) > self.chase_range):
+                    # Go back to patrolling
+                    self.attacking_target = None
+                
+                # Skip normal patrol behavior when attacking
+                if self.attacking_target:
+                    return False
         
-        return False  # Patrol behavior continues indefinitely
+        # If no enemies, continue patrolling
+        # Calculate distance to current target
+        dist = distance(self.unit.position, self.current_target)
+        
+        # If reached current target, switch direction
+        if dist < self.arrival_threshold:
+            # Slow down as we reach the patrol point
+            self.unit.velocity[0] *= 0.7
+            self.unit.velocity[1] *= 0.7
+            
+            # If nearly stopped, switch target
+            if abs(self.unit.velocity[0]) < 10 and abs(self.unit.velocity[1]) < 10:
+                self.moving_to_end = not self.moving_to_end
+                self.current_target = self.end_position if self.moving_to_end else self.start_position
+        
+        # Move toward current target
+        self._move_toward_target(self.current_target, dt)
+        
+        return False
+    
+    def _move_toward_target(self, target_position, dt):
+        """Apply force to move toward target."""
+        return self._standardized_move_toward(target_position, dt)
+    
+    def _check_for_enemies(self):
+        """Check for enemies in aggro range."""
+        if self.unit.attack_damage <= 0 or self.unit.attack_range <= 0:
+            return None
+            
+        # Import here to avoid circular imports
+        from game import Game
+        
+        # Look for enemies in aggro range
+        enemies = [e for e in Game.instance.entities 
+                   if hasattr(e, 'player_id') and e.player_id != self.unit.player_id
+                   and hasattr(e, 'health') and e.health > 0]
+        
+        # Find closest enemy in aggro range
+        enemies_in_range = []
+        for enemy in enemies:
+            if distance(self.unit.position, enemy.position) <= self.unit.aggro_range:
+                enemies_in_range.append(enemy)
+        
+        if enemies_in_range:
+            # Target closest enemy
+            return min(enemies_in_range, 
+                     key=lambda e: distance(self.unit.position, e.position))
+        
+        return None
+    
+    def _apply_melee_damage(self, target):
+        """Apply melee damage to target on collision."""
+        if hasattr(target, 'take_damage') and self.unit.attack_cooldown <= 0:
+            damage = self.unit.attack_damage
+            target.take_damage(damage)
+            self.unit.attack_cooldown = self.unit.attack_cooldown_max
+            self.unit.show_attack_effect = True
+            self.unit.effect_timer = 0
+    
+    def _fire_ranged_attack(self, target):
+        """Fire a ranged attack at the target."""
+        if not target or not hasattr(target, 'take_damage'):
+            return
+            
+        # Apply damage to target
+        damage = self.unit.attack_damage
+        target.take_damage(damage)
+        
+        # Reset attack cooldown
+        self.unit.attack_cooldown = self.unit.attack_cooldown_max
+        
+        # Show attack effect
+        self.unit.show_attack_effect = True
+        self.unit.effect_timer = 0
     
     def is_finished(self):
-        """Patrol is never finished unless interrupted."""
+        """Patrol behavior only ends when explicitly changed."""
         return False 

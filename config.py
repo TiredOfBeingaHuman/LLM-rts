@@ -71,9 +71,9 @@ class BuildingConfig:
 class ResourceConfig:
     RESOURCE_SIZE = 30
     RESOURCE_AMOUNT = 500
-    RESOURCE_GATHER_RATE = 1
-    HARVEST_TIME = 3.0
-    DEPOSIT_TIME = 1.0
+    RESOURCE_GATHER_RATE = 2
+    HARVEST_TIME = 1.5
+    DEPOSIT_TIME = 0.5
     NUM_SLOTS = 4  # Number of harvest slots per resource
 
 # AI settings
@@ -83,10 +83,26 @@ class AIConfig:
 
 # Movement and collision settings
 class MovementConfig:
+    # Physics parameters
+    FRICTION = 0.95            # Base friction coefficient 
+    RESTITUTION = 0.5          # Bounciness factor for collisions
+    
+    # Unit steering parameters
+    STEERING_BASE_FORCE = 1000  # Base force for steering
+    MAX_SPEED_MULTIPLIER = 1.2  # Maximum speed as a multiplier of unit.speed
+    
+    # Group movement parameters
     FORMATION_BASE_RADIUS = 20
     FORMATION_SCALE_FACTOR = 10
-    SEPARATION_WEIGHT = 0.3
-    SEPARATION_RADIUS = 20
-    ARRIVAL_THRESHOLD = 5.0
-    PUSH_THRESHOLD = 2.0
-    APPROACH_SLOWDOWN_DISTANCE = 50 
+    SEPARATION_WEIGHT = 0.4     # Weight for separation steering
+    SEPARATION_RADIUS = 30      # Radius for separation behavior
+    COHESION_WEIGHT = 0.1       # Weight for cohesion steering (stay with group)
+    COHESION_RADIUS = 80        # Radius for cohesion behavior
+    
+    # Arrival behavior
+    ARRIVAL_THRESHOLD = 20.0    # Distance at which target is considered reached
+    SLOWDOWN_RADIUS = 50.0      # Start slowing down when this close to target
+    
+    # Collision parameters
+    COLLISION_PUSH_FORCE = 300  # Force applied when colliding with static objects
+    MELEE_ATTACK_DISTANCE = 5.0 # Distance for melee damage to be applied 

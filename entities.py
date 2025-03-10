@@ -23,12 +23,64 @@ class Entity:
         self.selected = False
         self.rect = pygame.Rect(position[0] - size/2, position[1] - size/2, size, size)
         self.angle = 0  # Orientation in radians
+        
+        # Physics properties
+        self.velocity = [0.0, 0.0]  # Current velocity vector
+        self.mass = size * size  # Mass based on size
+        self.restitution = 0.5  # Bounciness factor (0=no bounce, 1=perfect bounce)
+        self.friction = 0.9  # Friction coefficient (0=no friction, 1=maximum friction)
+        self.max_speed = 300.0  # Maximum speed cap
+        self.is_static = False  # Static entities don't move (buildings, resources)
     
     def update(self, dt):
         """Update entity state. Called every frame."""
+        # Clamp dt to prevent huge jumps when game loses focus
+        dt = min(dt, 0.05)  # Cap at 50ms (20fps)
+        
+        # Apply velocity to position
+        if not self.is_static and (abs(self.velocity[0]) > 0.1 or abs(self.velocity[1]) > 0.1):
+            # Apply position update with scaled dt
+            self.position[0] += self.velocity[0] * dt
+            self.position[1] += self.velocity[1] * dt
+            
+            # Apply friction to slow down over time - more aggressive at low speeds
+            friction_factor = self.friction ** dt  # Scale friction by dt
+            
+            # Apply stronger friction at very low speeds to prevent oscillation
+            vel_magnitude = math.sqrt(self.velocity[0]**2 + self.velocity[1]**2)
+            if vel_magnitude < 10.0:  # When moving slowly
+                low_speed_factor = max(0.5, vel_magnitude / 10.0)  # Stronger damping
+                friction_factor *= low_speed_factor
+            
+            self.velocity[0] *= friction_factor
+            self.velocity[1] *= friction_factor
+            
+            # If velocity is very small, zero it out to prevent jitter
+            if abs(self.velocity[0]) < 0.3 and abs(self.velocity[1]) < 0.3:
+                self.velocity[0] = 0
+                self.velocity[1] = 0
+        
         # Update collision rect
         self.rect.x = self.position[0] - self.size/2
         self.rect.y = self.position[1] - self.size/2
+    
+    def apply_force(self, force_x, force_y):
+        """Apply a force to this entity, changing its velocity based on mass."""
+        if not self.is_static:
+            # F = ma, so a = F/m
+            accel_x = force_x / self.mass
+            accel_y = force_y / self.mass
+            
+            # Update velocity
+            self.velocity[0] += accel_x
+            self.velocity[1] += accel_y
+            
+            # Cap speed if needed
+            speed = math.sqrt(self.velocity[0]**2 + self.velocity[1]**2)
+            if speed > self.max_speed:
+                ratio = self.max_speed / speed
+                self.velocity[0] *= ratio
+                self.velocity[1] *= ratio
     
     def render(self, renderer):
         """Render the entity using the vector renderer."""
@@ -56,6 +108,7 @@ class Resource(Entity):
         self.max_amount = amount
         self.slots = [None, None, None, None]  # Up to 4 workers can mine at once
         self.slot_positions = self._calculate_slot_positions()
+        self.is_static = True  # Resources don't move
     
     def _calculate_slot_positions(self):
         """Calculate positions for up to 4 workers to mine this resource (aligned with sides)."""
@@ -183,7 +236,7 @@ class Unit(Entity):
         super().__init__(position, size, color)
         self.max_health = max_health
         self.health = max_health
-        self.speed = speed
+        self.speed = speed  # Now determines force magnitude applied, not direct speed
         self.target_position = None
         self.player_id = player_id  # 0 for player, 1 for enemy
         self.carrying_resources = 0
@@ -195,6 +248,12 @@ class Unit(Entity):
         self.attack_damage = 0
         self.collision_radius = size/2  # Radius for collision detection
         
+        # Physics properties specific to units
+        self.is_static = False
+        self.max_speed = speed * 1.5  # Maximum speed is higher than base speed
+        self.steering_force = speed * 0.5  # Force applied for steering
+        self.target_reached_threshold = 25.0  # Distance at which target is considered reached
+        
         # Visual effects
         self.show_gather_effect = False
         self.show_attack_effect = False
@@ -205,7 +264,7 @@ class Unit(Entity):
     
     def update(self, dt):
         """Update unit state."""
-        # Call parent update
+        # Call parent update which handles physics
         super().update(dt)
         
         try:
@@ -216,23 +275,6 @@ class Unit(Entity):
                     self.show_gather_effect = False
                     self.show_attack_effect = False
                     self.effect_timer = 0
-            
-            # Save original position for collision resolution
-            original_position = list(self.position)
-            
-            # Update position based on velocity (for physics effects)
-            if hasattr(self, 'velocity'):
-                self.position[0] += self.velocity[0] * dt
-                self.position[1] += self.velocity[1] * dt
-                
-                # Dampen velocity over time
-                self.velocity[0] *= 0.9
-                self.velocity[1] *= 0.9
-                
-                # If velocity is very small, zero it out to prevent jitter
-                if abs(self.velocity[0]) < 0.1 and abs(self.velocity[1]) < 0.1:
-                    self.velocity[0] = 0
-                    self.velocity[1] = 0
             
             # Update attack cooldown
             if self.attack_cooldown > 0:
@@ -262,12 +304,8 @@ class Unit(Entity):
                     from behaviors import IdleBehavior
                     self.current_behavior = IdleBehavior(self)
             
-            # Update collision rect
-            self.rect.x = self.position[0] - self.size/2
-            self.rect.y = self.position[1] - self.size/2
-            
-            # Resolve collisions with other entities
-            self._resolve_unit_collisions()
+            # Check for collisions with other entities (now handled as physics interactions)
+            self._handle_collisions()
             
             # Auto-engage enemies in aggro range if idle
             from behaviors import IdleBehavior
@@ -279,96 +317,125 @@ class Unit(Entity):
         except Exception as e:
             print(f"Error in unit update: {e}")
     
-    def _resolve_unit_collisions(self):
-        """Prevent units from overlapping with other entities.
-           Units should never be able to traverse buildings or resources.
-           Only the unit calling this method will be moved."""
+    def _handle_collisions(self):
+        """Handle collisions using physics interactions."""
         game_instance = get_game_instance()
         if not game_instance:
             return
         
-        # If we're attacking, allow us to get closer to our target
-        from behaviors import AttackBehavior
-        attacking_target = None
-        if isinstance(self.current_behavior, AttackBehavior) and hasattr(self.current_behavior, 'target'):
-            attacking_target = self.current_behavior.target
-        
         # Check collisions with all entities
         for other in game_instance.entities:
-            if other is self or not hasattr(other, "rect"):
+            if other is self or not hasattr(other, "position"):
                 continue
                 
-            # Skip collision resolution if we're attacking this specific entity
-            if attacking_target is not None and other is attacking_target:
-                # Allow dot units to get close enough to attack buildings
-                if isinstance(attacking_target, Building) and isinstance(self, Dot):
-                    # Skip collision completely to let melee units approach buildings
-                    print(f"Dot attacking building: Skipping collision resolution")
-                    continue
-                    
-                # Also add general case for any unit attacking
-                print(f"Unit attacking target: Distance = {distance(self.position, other.position)}")
-                # Reduce the collision avoidance for attacking units
-                continue
+            # Calculate distance between entities
+            dx = self.position[0] - other.position[0]
+            dy = self.position[1] - other.position[1]
+            dist = math.sqrt(dx*dx + dy*dy)
             
-            # Create slightly larger collision rect for buildings/resources to avoid getting too close
-            other_rect = other.rect.copy()
-            if not isinstance(other, Unit):
-                # Add a small buffer around buildings and resources
-                other_rect.inflate_ip(4, 4)
+            # Minimum distance to maintain (sum of radii)
+            min_dist = (self.size + other.size) / 2.0
+            
+            # Special case for worker units returning to command centers
+            from behaviors import GatherBehavior
+            from entities import CommandCenter
+            
+            is_depositing = (hasattr(self, 'current_behavior') and 
+                            isinstance(self.current_behavior, GatherBehavior) and
+                            self.current_behavior.state in ["RETURNING", "DEPOSITING"] and
+                            isinstance(other, CommandCenter))
+            
+            # If worker is returning to command center, allow it to get closer
+            if is_depositing:
+                min_dist = min_dist * 0.5  # Allow to get much closer to command center
+            
+            # If we're too close
+            if dist < min_dist and dist > 0:  # Avoid division by zero
+                # Calculate overlap
+                overlap = min_dist - dist
                 
-            # If we're colliding with another entity
-            if self.rect.colliderect(other_rect):
-                # Only the current unit (self) gets pushed, not buildings or resources
-                overlap = self.rect.clip(other_rect)
+                # Calculate normalized direction vector
+                nx = dx / dist
+                ny = dy / dist
                 
-                # Calculate push direction (away from the other entity)
-                dx = self.position[0] - other.position[0]
-                dy = self.position[1] - other.position[1]
+                # Special case for dot attacking - melee units can get closer to their targets
+                from behaviors import AttackBehavior
+                is_attacking_target = False
+                if isinstance(self.current_behavior, AttackBehavior) and hasattr(self.current_behavior, 'target'):
+                    if self.current_behavior.target is other and isinstance(self, Dot):
+                        is_attacking_target = True
                 
-                # Add a tiny random offset to avoid units getting stuck
-                dx += random.uniform(-1.0, 1.0)
-                dy += random.uniform(-1.0, 1.0)
-                
-                # Small threshold to prevent jitter when just touching
-                push_threshold = 2.0
-                
-                # Push along the axis with smallest overlap, plus some extra to avoid re-collision
-                if overlap.width <= overlap.height:
-                    # Push horizontally
-                    push_amount = overlap.width + push_threshold
-                    if dx < 0:
-                        self.position[0] -= push_amount
+                # Apply collision response based on entity types
+                if other.is_static:
+                    # If depositing resources or attacking, allow getting closer
+                    if is_depositing or is_attacking_target:
+                        # Apply a much gentler push to allow worker to deposit
+                        push_force = overlap * 2.0  # Gentle push
+                        self.position[0] += nx * overlap * 0.5
+                        self.position[1] += ny * overlap * 0.5
                     else:
-                        self.position[0] += push_amount
+                        # Static entities (buildings, resources) push units away with high force
+                        push_force = overlap * 10.0  # Strong push force
+                        self.position[0] += nx * overlap
+                        self.position[1] += ny * overlap
+                        
+                        # Add opposing velocity to prevent sticking
+                        self.velocity[0] = nx * push_force
+                        self.velocity[1] = ny * push_force
                 else:
-                    # Push vertically
-                    push_amount = overlap.height + push_threshold
-                    if dy < 0:
-                        self.position[1] -= push_amount
-                    else:
-                        self.position[1] += push_amount
-                
-                # Update collision rect after being pushed
-                self.rect.x = self.position[0] - self.size/2
-                self.rect.y = self.position[1] - self.size/2
-                
-                # Add a tiny velocity to help units separate
-                if isinstance(other, Unit):
-                    # Calculate unit direction vector
-                    dist = ((dx * dx) + (dy * dy)) ** 0.5
-                    if dist > 0:
-                        normalized_dx = dx / dist
-                        normalized_dy = dy / dist
+                    # Dynamic entities (other units) exchange momentum and have elastic collisions
+                    # Calculate mass ratio
+                    mass_ratio_self = self.mass / (self.mass + other.mass)
+                    mass_ratio_other = other.mass / (self.mass + other.mass)
+                    
+                    # Move both entities apart proportionally to their mass
+                    self.position[0] += nx * overlap * (1 - mass_ratio_self)
+                    self.position[1] += ny * overlap * (1 - mass_ratio_self)
+                    
+                    # Don't move the other entity if we're attacking it (for melee units)
+                    if not is_attacking_target and not other.is_static:
+                        other.position[0] -= nx * overlap * (1 - mass_ratio_other)
+                        other.position[1] -= ny * overlap * (1 - mass_ratio_other)
+                    
+                    # Exchange momentum (elastic collision)
+                    if not is_attacking_target:
+                        # Calculate relative velocity
+                        vx = self.velocity[0] - other.velocity[0]
+                        vy = self.velocity[1] - other.velocity[1]
                         
-                        # Add a small separation force
-                        separation_force = 5.0
-                        self.position[0] += normalized_dx * separation_force
-                        self.position[1] += normalized_dy * separation_force
+                        # Calculate velocity dot product with normal
+                        vel_dot_normal = vx * nx + vy * ny
                         
-                        # Update rect once more
-                        self.rect.x = self.position[0] - self.size/2
-                        self.rect.y = self.position[1] - self.size/2
+                        # Only apply collision if objects are moving toward each other
+                        if vel_dot_normal < 0:
+                            # Calculate impulse scalar
+                            impulse = -(1 + self.restitution) * vel_dot_normal
+                            impulse /= (1/self.mass) + (1/other.mass)
+                            
+                            # Apply impulse to velocities
+                            impulse_x = impulse * nx / self.mass
+                            impulse_y = impulse * ny / self.mass
+                            
+                            self.velocity[0] += impulse_x
+                            self.velocity[1] += impulse_y
+                            
+                            # Apply opposite impulse to other unit
+                            if not other.is_static:
+                                other.velocity[0] -= impulse * nx / other.mass
+                                other.velocity[1] -= impulse * ny / other.mass
+                                
+                                # If melee unit is close to its target, deal damage
+                                if isinstance(self, Dot) and is_attacking_target and self.attack_cooldown <= 0:
+                                    self._apply_melee_damage(other)
+    
+    def _apply_melee_damage(self, target):
+        """Apply melee damage to target on collision."""
+        if hasattr(target, 'take_damage') and self.attack_cooldown <= 0:
+            damage = self.attack_damage
+            target.take_damage(damage)
+            self.attack_cooldown = self.attack_cooldown_max
+            self.show_attack_effect = True
+            self.effect_timer = 0
     
     def _check_for_enemies_in_range(self):
         """Check for enemies in aggro range and engage them if found."""
@@ -399,170 +466,112 @@ class Unit(Entity):
             self.attack(closest_enemy)
     
     def move_to(self, position):
-        """Order the unit to move to a position."""
-        self.target_position = position
+        """Order unit to move to a position."""
         self.current_behavior = MoveBehavior(self, position)
     
     def gather(self, resource):
-        """Override gather so that harvesters snap to a designated resource slot."""
-        # Try to get a harvesting slot
-        slot_position = resource.assign_harvest_slot(self)
-        
-        # If no slot is available, just set behavior without moving
-        if slot_position is None:
-            self.current_behavior = GatherBehavior(self, resource)
-            return
-            
-        # If we got a slot, move to it
-        self.move_to(slot_position)
+        """Order unit to gather from a resource."""
         self.current_behavior = GatherBehavior(self, resource)
     
     def attack(self, target):
-        """Order the unit to attack a target."""
+        """Order unit to attack a target."""
         self.current_behavior = AttackBehavior(self, target)
     
     def take_damage(self, amount):
-        """Take damage and return True if destroyed."""
-        print(f"Building {type(self).__name__} taking {amount} damage. Current health: {self.health}")
-        old_health = self.health
+        """Take damage and check if destroyed."""
         self.health -= amount
-        print(f"Building health after damage: {self.health}, was destroyed: {self.health <= 0}")
-        if old_health > 0 and self.health <= 0:
-            print(f"Building {type(self).__name__} was destroyed!")
         return self.health <= 0
     
     def render(self, renderer):
-        """Render the unit."""
-        # Get game instance for debug mode
-        game_instance = get_game_instance()
-        
-        # Draw selection circle if selected
-        if self.selected:
-            renderer.draw_circle(self.position, self.size*0.75, WHITE, 1)
+        # Draw health bar if not at full health
+        health_pct = self.health / self.max_health
+        if health_pct < 1.0:
+            width = self.size
+            height = 2
+            x = self.position[0] - width/2
+            y = self.position[1] - self.size/2 - 5
             
-            # Draw aggro range when selected and in debug mode
-            if self.aggro_range > 0 and game_instance and game_instance.show_debug:
-                renderer.draw_circle(self.position, self.aggro_range, (255, 100, 100), 1, False)
-                
-            # Draw attack range when selected and in debug mode
-            if self.attack_range > 0 and game_instance and game_instance.show_debug:
-                renderer.draw_circle(self.position, self.attack_range, (255, 50, 50), 1, False)
+            # Background
+            renderer.draw_rect(pygame.Rect(x, y, width, height), (50, 50, 50), 0, True)
+            
+            # Health fill
+            if health_pct > 0:
+                fill_width = max(1, int(width * health_pct))
+                renderer.draw_rect(pygame.Rect(x, y, fill_width, height), GREEN, 0, True)
         
-        # Draw health bar if damaged
-        if self.health < self.max_health:
-            health_pct = self.health / self.max_health
-            bar_width = self.size * 1.2
-            renderer.draw_rect(
-                pygame.Rect(
-                    self.position[0] - bar_width/2,
-                    self.position[1] - self.size - 5,
-                    bar_width,
-                    3
-                ),
-                RED,
-                0,
-                True
-            )
-            renderer.draw_rect(
-                pygame.Rect(
-                    self.position[0] - bar_width/2,
-                    self.position[1] - self.size - 5,
-                    bar_width * health_pct,
-                    3
-                ),
-                GREEN,
-                0,
-                True
-            )
+        # Draw selection circle
+        if self.selected:
+            renderer.draw_circle(self.position, self.size/2 + 2, WHITE, 1, False)
         
-        # Draw resource indicator if carrying
-        if self.carrying_resources > 0:
-            renderer.draw_text(
-                f"{self.carrying_resources}",
-                (self.position[0], self.position[1] + self.size + 5),
-                CYAN,
-                16
-            )
-        
-        # Draw visual effects
+        # Draw effect indicators
         if self.show_gather_effect:
-            # Draw gathering effect (sparkles)
-            renderer.draw_circle(
-                (self.position[0] + random.uniform(-self.size/2, self.size/2),
-                 self.position[1] + random.uniform(-self.size/2, self.size/2)),
-                2, CYAN, 0, True
-            )
+            renderer.draw_circle(self.position, self.size * 0.75, CYAN, 1, False)
         
         if self.show_attack_effect:
-            # Draw attack effect
-            renderer.draw_circle(
-                (self.position[0] + random.uniform(-self.size/2, self.size/2),
-                 self.position[1] + random.uniform(-self.size/2, self.size/2)),
-                3, RED, 0, True
-            )
-
+            renderer.draw_circle(self.position, self.size * 0.75, RED, 1, False)
+    
     def attack_move(self, position):
-        """Order the unit to move to a position while attacking enemies encountered."""
+        """Move to a position while attacking any enemies encountered."""
         self.current_behavior = AttackMoveBehavior(self, position)
     
     def hold_position(self):
-        """Order the unit to hold its current position."""
+        """Hold position and attack enemies in range."""
         self.current_behavior = HoldPositionBehavior(self)
-        
+    
     def patrol(self, position):
-        """Order the unit to patrol between its current position and the target position."""
-        from behaviors import PatrolBehavior
-        # Store current position as the start of patrol route
-        start_position = self.position.copy()
-        self.current_behavior = PatrolBehavior(self, start_position, position)
+        """Patrol between current position and destination."""
+        start_pos = list(self.position)  # Copy current position
+        self.current_behavior = PatrolBehavior(self, start_pos, position)
 
 
 class Square(Unit):
-    """Worker unit that gathers resources. Squares are used to gather resources and build structures."""
+    """Worker unit that gathers resources and builds structures."""
     
     def __init__(self, position: List[float], player_id: int = 0):
-        """Initialize a Square worker unit.
-        
-        Args:
-            position: [x, y] position coordinates
-            player_id: 0 for player, 1 for enemy
-        """
-        color = BLUE if player_id == 0 else RED
+        color = GREEN if player_id == 0 else RED
         super().__init__(
             position, 
-            UnitConfig.WORKER_SIZE,  # Size from config
+            UnitConfig.WORKER_SIZE,
             color, 
-            UnitConfig.WORKER_HEALTH,  # Health from config
-            UnitConfig.WORKER_SPEED,  # Speed from config
+            UnitConfig.WORKER_HEALTH, 
+            UnitConfig.WORKER_SPEED, 
             player_id
         )
-        self.max_carry_capacity = UnitConfig.WORKER_CARRY_CAPACITY  # Capacity from config
+        self.max_carry_capacity = UnitConfig.WORKER_CARRY_CAPACITY
+        
+        # Physics properties specific to workers
+        self.mass = UnitConfig.WORKER_SIZE * 1.3  # Medium mass for stability
+        self.friction = 0.96  # Higher friction for quicker stopping
+        self.max_speed = UnitConfig.WORKER_SPEED  # Use exact speed value
+        self.steering_force = MovementConfig.STEERING_BASE_FORCE * 0.45  # Lower steering force
+        self.restitution = 0.2  # Low bounciness
+        self.target_reached_threshold = 25.0  # Smaller arrival zone than combat units
     
     def gather(self, resource: 'Resource') -> None:
-        """Override gather so that harvesters snap to a designated resource slot.
-        
-        Args:
-            resource: The resource to gather from
-        """
-        # Try to get a harvesting slot
-        slot_position = resource.assign_harvest_slot(self)
-        
-        # If no slot is available, just set behavior without moving
-        if slot_position is None:
-            self.current_behavior = GatherBehavior(self, resource)
-            return
-            
-        # If we got a slot, move to it
-        self.move_to(slot_position)
+        """Order this unit to gather from a resource."""
+        # Use the behavior system to handle gathering
         self.current_behavior = GatherBehavior(self, resource)
     
     def render(self, renderer):
-        # Draw as a square
-        points = create_square(self.position, self.size)
+        """Render the worker as a square."""
+        # Calculate square points based on position and rotation
+        points = create_square(self.position, self.size, self.angle)
+        
+        # Draw the square
         renderer.draw_polygon(points, self.color, 0, True)
         renderer.draw_polygon(points, WHITE, 1, False)
         
-        super().render(renderer)  # Draw health bar, selection, etc.
+        # Draw resource indicator if carrying resources
+        if self.carrying_resources > 0:
+            renderer.draw_text(
+                f"{self.carrying_resources}",
+                (self.position[0], self.position[1] - 10),
+                CYAN,
+                10
+            )
+        
+        # Call parent render for health and selection indicators
+        super().render(renderer)
 
 
 class Dot(Unit):
@@ -582,31 +591,18 @@ class Dot(Unit):
         self.aggro_range = UnitConfig.DOT_AGGRO_RANGE
         self.attack_cooldown_max = UnitConfig.DOT_ATTACK_COOLDOWN
         self.attack_damage = UnitConfig.DOT_ATTACK_DAMAGE
-        self.can_attack_buildings = True  # Flag to indicate this unit can attack buildings
+        
+        # Physics properties specific to dots (fast melee units)
+        self.mass = UnitConfig.DOT_SIZE * 1.4  # Higher mass for stability
+        self.friction = 0.95  # Higher friction to stop quicker
+        self.max_speed = UnitConfig.DOT_SPEED  # Use exact speed value
+        self.steering_force = MovementConfig.STEERING_BASE_FORCE * 0.5  # Lower force for smoother movement
+        self.restitution = 0.1  # Very low bounciness
+        self.target_reached_threshold = 35.0  # Wider arrival zone for clusters
     
     def attack(self, target):
-        """Order this dot to attack a target, ensuring it can damage buildings."""
-        # Use the parent attack method but first check if the target is a building
-        from behaviors import AttackBehavior
-        
-        # Special case for buildings
-        if isinstance(target, Building):
-            print(f"Dot attacking building: {type(target).__name__} at {distance(self.position, target.position)}")
-            
-            # Store original attack range and damage
-            original_damage = self.attack_damage
-            
-            # Temporarily increase damage against buildings
-            self.attack_damage = self.attack_damage * 1.5
-            
-            # Create the attack behavior with boosted stats
-            self.current_behavior = AttackBehavior(self, target)
-            
-            # Reset stats
-            self.attack_damage = original_damage
-        else:
-            # Normal attack for non-buildings
-            self.current_behavior = AttackBehavior(self, target)
+        """Order this unit to attack a target. Dots use physics-based melee attacks."""
+        self.current_behavior = AttackBehavior(self, target)
     
     def render(self, renderer):
         # Draw as a circle
@@ -619,6 +615,13 @@ class Dot(Unit):
         # Draw aggro range when selected and in debug mode
         if self.selected and game_instance and game_instance.show_debug:
             renderer.draw_circle(self.position, self.aggro_range, self.color, 1, False)
+            # Draw velocity vector when in debug mode
+            if abs(self.velocity[0]) > 0.1 or abs(self.velocity[1]) > 0.1:
+                vel_end = [
+                    self.position[0] + self.velocity[0] * 0.5,
+                    self.position[1] + self.velocity[1] * 0.5
+                ]
+                renderer.draw_line(self.position, vel_end, YELLOW, 1)
         
         super().render(renderer)  # Draw health bar, selection, etc.
 
@@ -628,11 +631,26 @@ class Triangle(Unit):
     
     def __init__(self, position, player_id=0):
         color = YELLOW if player_id == 0 else RED
-        super().__init__(position, 25, color, 40, 70, player_id)
-        self.attack_range = 150         # Range where it can attack
-        self.aggro_range = 250          # Range where it will detect and chase enemies
-        self.attack_cooldown_max = 1.0
-        self.attack_damage = 15
+        super().__init__(
+            position, 
+            UnitConfig.TRIANGLE_SIZE,
+            color, 
+            UnitConfig.TRIANGLE_HEALTH, 
+            UnitConfig.TRIANGLE_SPEED, 
+            player_id
+        )
+        self.attack_range = UnitConfig.TRIANGLE_ATTACK_RANGE
+        self.aggro_range = UnitConfig.TRIANGLE_AGGRO_RANGE
+        self.attack_cooldown_max = UnitConfig.TRIANGLE_ATTACK_COOLDOWN
+        self.attack_damage = UnitConfig.TRIANGLE_ATTACK_DAMAGE
+        
+        # Physics properties specific to triangles (heavy ranged units)
+        self.mass = UnitConfig.TRIANGLE_SIZE * 3.0  # Very heavy mass for stability
+        self.friction = 0.97  # Very high friction to stop quickly
+        self.max_speed = UnitConfig.TRIANGLE_SPEED  # Use exact speed value
+        self.steering_force = MovementConfig.STEERING_BASE_FORCE * 0.4  # Very low steering force
+        self.restitution = 0.05  # Almost no bounce
+        self.target_reached_threshold = 45.0  # Very wide zone for ranged units
     
     def render(self, renderer):
         # Draw as a triangle
@@ -649,6 +667,13 @@ class Triangle(Unit):
             renderer.draw_circle(self.position, self.attack_range, (255, 50, 50), 1, False)
             # Draw aggro range
             renderer.draw_circle(self.position, self.aggro_range, (255, 100, 100), 1, False)
+            # Draw velocity vector when in debug mode
+            if abs(self.velocity[0]) > 0.1 or abs(self.velocity[1]) > 0.1:
+                vel_end = [
+                    self.position[0] + self.velocity[0] * 0.5,
+                    self.position[1] + self.velocity[1] * 0.5
+                ]
+                renderer.draw_line(self.position, vel_end, YELLOW, 1)
         
         super().render(renderer)  # Draw health bar, selection, etc.
 
@@ -665,6 +690,7 @@ class Building(Entity):
         self.build_progress = 0
         self.build_time = 0
         self.rally_point = None
+        self.is_static = True  # Buildings don't move
     
     def update(self, dt):
         super().update(dt)
@@ -699,19 +725,17 @@ class Building(Entity):
                     new_unit = Dot(spawn_pos, self.player_id)
                 elif unit_type == "triangle":
                     new_unit = Triangle(spawn_pos, self.player_id)
-            else:
-                # Already a class reference
-                new_unit = unit_type(spawn_pos, self.player_id)
-            
+        
+            # Add the unit to the game
             if new_unit:
-                # Get the game instance
-                game_instance = get_game_instance()
-                if game_instance:
-                    game_instance.add_entity(new_unit)
+                from game import Game
+                Game.instance.add_entity(new_unit)
+                
+                # Send the unit to the rally point if set
+                if self.rally_point:
+                    new_unit.move_to(self.rally_point)
                     
-                    # Send to rally point if set
-                    if self.rally_point:
-                        new_unit.move_to(self.rally_point)
+                print(f"Produced {unit_type} unit")
         except Exception as e:
             print(f"Error completing production: {e}")
         
@@ -787,8 +811,7 @@ class Building(Entity):
             self.build_time = self._get_build_time(unit_type_name)
             # Safety check to ensure build_time is valid
             if self.build_time <= 0:
-                self.build_time = 5.0  # Default build time if lookup fails
-            self.build_progress = 0.0  # Reset build progress
+                self.build_time = 5.0  # Default production time if lookup fails
         
         return True
     
@@ -854,8 +877,9 @@ class Building(Entity):
                     bar_width,
                     5
                 ),
-                WHITE,
-                1
+                (50, 50, 100),  # Dark blue background
+                0,
+                True
             )
             renderer.draw_rect(
                 pygame.Rect(
@@ -864,7 +888,7 @@ class Building(Entity):
                     bar_width * progress,
                     5
                 ),
-                BLUE,
+                BLUE,  # Blue fill
                 0,
                 True
             )
@@ -891,13 +915,24 @@ class CommandCenter(Building):
         # Get game instance
         game_instance = get_game_instance()
         if game_instance:
-            game_instance.resources[self.player_id] += amount
-        
-        # Visual feedback
-        self.resource_queue.append({
-            "amount": amount,
-            "timer": 0.5  # Show for 0.5 seconds
-        })
+            # Ensure amount is a number
+            try:
+                amount = int(amount)
+                if amount > 0:
+                    # Add to player's resources
+                    game_instance.resources[self.player_id] += amount
+                    print(f"Added {amount} resources to player {self.player_id}, total: {game_instance.resources[self.player_id]}")
+                    
+                    # Visual feedback
+                    self.resource_queue.append({
+                        "amount": amount,
+                        "timer": 0.5  # Show for 0.5 seconds
+                    })
+                    return True
+            except Exception as e:
+                print(f"Error adding resources: {e}")
+                
+        return False
     
     def update(self, dt):
         super().update(dt)

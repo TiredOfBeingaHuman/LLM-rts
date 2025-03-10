@@ -20,6 +20,13 @@ class Game:
         self.screen_width = screen_width
         self.screen_height = screen_height
         
+        # World dimensions (larger than screen)
+        self.world_width = 4000
+        self.world_height = 3000
+        
+        # Camera offset for scrolling
+        self.camera_offset = [0, 0]
+        
         # Game state
         self.entities = []
         self.selected_entities = []
@@ -225,10 +232,21 @@ class Game:
     
     def update(self, dt):
         """Update the game state for one frame."""
+        # Clamp dt to prevent physics issues when game loses focus
+        dt = min(dt, 0.05)  # Cap at 50ms (20fps) to prevent large physics jumps
+        
         if self.paused or self.game_over:
             return
         
         try:
+            # Stabilize the selected entities if any are idle
+            for entity in self.selected_entities:
+                if hasattr(entity, 'current_behavior') and isinstance(entity.current_behavior, behaviors.IdleBehavior):
+                    # Ensure idle entities don't drift
+                    if hasattr(entity, 'velocity'):
+                        entity.velocity[0] = 0
+                        entity.velocity[1] = 0
+            
             # Update all entities
             entities_to_remove = []
             for entity in list(self.entities):  # Create a copy to avoid modification during iteration
@@ -397,6 +415,10 @@ class Game:
         if self.attack_move_mode and pygame.mouse.get_pos()[1] < self.screen_height - self.ui_panel_height:
             self._render_attack_move_cursor(screen, renderer, pygame.mouse.get_pos())
         
+        # Render patrol cursor if in patrol mode
+        if self.patrol_mode and pygame.mouse.get_pos()[1] < self.screen_height - self.ui_panel_height:
+            self._render_patrol_cursor(screen, renderer, pygame.mouse.get_pos())
+        
         # Render UI
         self._render_ui(screen, renderer)
         
@@ -453,6 +475,50 @@ class Game:
         pygame.draw.circle(screen, RED, pos, 15, 2)
         pygame.draw.line(screen, RED, (pos[0] - 20, pos[1]), (pos[0] + 20, pos[1]), 2)
         pygame.draw.line(screen, RED, (pos[0], pos[1] - 20), (pos[0], pos[1] + 20), 2)
+    
+    def _render_patrol_cursor(self, screen, renderer, pos):
+        """Render a custom cursor for patrol mode."""
+        # Define patrol blue color
+        PATROL_BLUE = (0, 100, 255)
+        
+        # Draw a blue targeting circle
+        pygame.draw.circle(screen, PATROL_BLUE, pos, 15, 2)
+        
+        # Draw patrol arrows in four directions
+        arrow_length = 20
+        arrow_width = 5
+        
+        # Right arrow
+        pygame.draw.line(screen, PATROL_BLUE, pos, (pos[0] + arrow_length, pos[1]), 2)
+        pygame.draw.polygon(screen, PATROL_BLUE, [
+            (pos[0] + arrow_length, pos[1]),
+            (pos[0] + arrow_length - arrow_width, pos[1] - arrow_width),
+            (pos[0] + arrow_length - arrow_width, pos[1] + arrow_width)
+        ])
+        
+        # Left arrow
+        pygame.draw.line(screen, PATROL_BLUE, pos, (pos[0] - arrow_length, pos[1]), 2)
+        pygame.draw.polygon(screen, PATROL_BLUE, [
+            (pos[0] - arrow_length, pos[1]),
+            (pos[0] - arrow_length + arrow_width, pos[1] - arrow_width),
+            (pos[0] - arrow_length + arrow_width, pos[1] + arrow_width)
+        ])
+        
+        # Up arrow
+        pygame.draw.line(screen, PATROL_BLUE, pos, (pos[0], pos[1] - arrow_length), 2)
+        pygame.draw.polygon(screen, PATROL_BLUE, [
+            (pos[0], pos[1] - arrow_length),
+            (pos[0] - arrow_width, pos[1] - arrow_length + arrow_width),
+            (pos[0] + arrow_width, pos[1] - arrow_length + arrow_width)
+        ])
+        
+        # Down arrow
+        pygame.draw.line(screen, PATROL_BLUE, pos, (pos[0], pos[1] + arrow_length), 2)
+        pygame.draw.polygon(screen, PATROL_BLUE, [
+            (pos[0], pos[1] + arrow_length),
+            (pos[0] - arrow_width, pos[1] + arrow_length - arrow_width),
+            (pos[0] + arrow_width, pos[1] + arrow_length - arrow_width)
+        ])
     
     def _render_ui(self, screen, renderer):
         """Render the game UI."""
@@ -706,14 +772,24 @@ class Game:
         if event.type == pygame.QUIT:
             return False
         
+        # Handle focus loss - zero out unit velocities to prevent physics issues
+        elif event.type == pygame.ACTIVEEVENT:
+            if event.gain == 0:  # Lost focus
+                # Reset velocities for all units to prevent drift when focus returns
+                for entity in self.entities:
+                    if hasattr(entity, 'velocity'):
+                        entity.velocity[0] = 0
+                        entity.velocity[1] = 0
+        
         # Handle keyboard events
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 # If in a special mode, cancel it
-                if self.build_mode or self.attack_move_mode:
+                if self.build_mode or self.attack_move_mode or self.patrol_mode:
                     self.build_mode = False
                     self.build_type = None
                     self.attack_move_mode = False
+                    self.patrol_mode = False
                     self.print_debug_info("Command canceled")
                 # Otherwise deselect everything
                 else:
@@ -721,9 +797,13 @@ class Game:
                     self.print_debug_info("All units deselected")
             elif event.key == pygame.K_SPACE:
                 self.paused = not self.paused
-            elif event.key == pygame.K_p:  # Add keyboard shortcut for pausing enemy
-                self.enemy_ai_paused = not self.enemy_ai_paused
-                self.print_debug_info(f"Enemy AI {'paused' if self.enemy_ai_paused else 'resumed'}")
+            elif event.key == pygame.K_p:  # P now controls patrol mode
+                # Check if we have combat units selected
+                combat_units = [e for e in self.selected_entities 
+                              if isinstance(e, (Dot, Triangle)) and e.player_id == 0]
+                if combat_units:
+                    self.patrol_mode = True
+                    self.print_debug_info("Patrol mode - click target location")
             elif event.key == pygame.K_F3:
                 self.show_debug = not self.show_debug
             elif event.key == pygame.K_r and self.game_over:
@@ -1231,8 +1311,14 @@ class Game:
     
     def _execute_patrol(self, pos):
         """Set patrol target for selected units."""
+        # Import behaviors module
+        import behaviors
+        
         # Convert screen position to world position
-        world_pos = self._screen_to_world(pos)
+        world_pos = [
+            pos[0] + self.camera_offset[0],
+            pos[1] + self.camera_offset[1]
+        ]
         
         # Get selected combat units
         combat_units = [e for e in self.selected_entities 
@@ -1241,9 +1327,9 @@ class Game:
         # Set patrol behavior for each unit
         for unit in combat_units:
             # Store current position as the start of patrol route
-            start_position = unit.position.copy()
+            start_position = list(unit.position)  # Make a copy
             # Create patrol behavior
-            unit.current_behavior = PatrolBehavior(unit, start_position, world_pos)
+            unit.current_behavior = behaviors.PatrolBehavior(unit, start_position, world_pos)
         
         # Exit patrol mode
         self.patrol_mode = False

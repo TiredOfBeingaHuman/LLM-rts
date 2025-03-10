@@ -51,16 +51,22 @@ def rotate_polygon(points, center, angle):
     """Rotate all points in a polygon around a center by angle (radians)."""
     return [rotate_point(point, center, angle) for point in points]
 
-def create_square(center, size):
-    """Create a square centered at center with side length size."""
+def create_square(center, size, angle=0):
+    """Create a square centered at center with side length size, rotated by angle (radians)."""
     half_size = size / 2
     x, y = center
-    return [
+    points = [
         (x - half_size, y - half_size),
         (x + half_size, y - half_size),
         (x + half_size, y + half_size),
         (x - half_size, y + half_size)
     ]
+    
+    # Rotate if needed
+    if angle != 0:
+        points = rotate_polygon(points, center, angle)
+    
+    return points
 
 def create_triangle(center, size, angle=0):
     """Create an equilateral triangle centered at center with side length size."""
