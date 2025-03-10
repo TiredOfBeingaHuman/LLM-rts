@@ -4,7 +4,7 @@ import sys
 import random
 import math
 from utils import WHITE, BLACK, RED, BLUE, GREEN, YELLOW, CYAN, distance
-from entities import Entity, Resource, Unit, Square, Dot, Triangle, Building, CommandCenter, UnitBuilding
+from entities import Entity, Resource, Unit, Square, Dot, Triangle, Building, CommandCenter, UnitBuilding, Turret
 import behaviors
 
 class Game:
@@ -425,6 +425,27 @@ class Game:
                                 (pos[0] + 30, pos[1] - 30),
                                 (pos[0] + 30, pos[1] + 30),
                                 (pos[0] - 30, pos[1] + 30)])
+        elif self.build_type == "turret":
+            # Draw a semi-transparent hexagon for turret
+            points = []
+            size = 20
+            for i in range(6):
+                angle = math.pi/3 * i
+                x = pos[0] + math.cos(angle) * size
+                y = pos[1] + math.sin(angle) * size
+                points.append((int(x), int(y)))
+            
+            # Draw the hexagon with semi-transparency
+            pygame.draw.polygon(screen, (*GREEN, 128), points)
+            
+            # Draw a line for the turret barrel
+            pygame.draw.line(screen, (255, 255, 255, 128), 
+                            pos, 
+                            (pos[0] + size, pos[1]), 
+                            3)
+            
+            # Draw attack range indicator
+            pygame.draw.circle(screen, (255, 255, 255, 30), pos, 150, 1)
     
     def _render_attack_move_cursor(self, screen, renderer, pos):
         """Render a custom cursor for attack-move mode."""
@@ -563,9 +584,9 @@ class Game:
         pygame.draw.rect(screen, (0, 0, 0), minimap_rect)
         pygame.draw.rect(screen, (100, 100, 100), minimap_rect, 1)
         
-        # Calculate scale factors
-        scale_x = minimap_rect.width / self.screen_width
-        scale_y = minimap_rect.height / self.screen_height
+        # Calculate scale factors for the entire world map
+        scale_x = minimap_rect.width / self.world_width
+        scale_y = minimap_rect.height / self.world_height
         
         # Draw entities on minimap
         for entity in self.entities:
@@ -598,7 +619,30 @@ class Game:
                 size = 1
             
             # Draw the entity on the minimap
-            pygame.draw.circle(screen, color, (int(mini_x), int(mini_y)), size)
+            if 0 <= mini_x <= minimap_rect.right and 0 <= mini_y <= minimap_rect.bottom:
+                pygame.draw.circle(screen, color, (int(mini_x), int(mini_y)), size)
+        
+        # Draw the current viewport as a rectangle
+        viewport_rect = pygame.Rect(
+            minimap_rect.x + self.camera_offset[0] * scale_x,
+            minimap_rect.y + self.camera_offset[1] * scale_y,
+            self.screen_width * scale_x,
+            (self.screen_height - self.ui_panel_height) * scale_y
+        )
+        pygame.draw.rect(screen, (255, 255, 255), viewport_rect, 1)
+        
+        # Handle minimap clicks to move the camera
+        mouse_pos = pygame.mouse.get_pos()
+        mouse_buttons = pygame.mouse.get_pressed()
+        
+        if mouse_buttons[0] and minimap_rect.collidepoint(mouse_pos):
+            # Calculate world position from minimap click
+            world_x = (mouse_pos[0] - minimap_rect.x) / scale_x
+            world_y = (mouse_pos[1] - minimap_rect.y) / scale_y
+            
+            # Center the camera on the clicked position
+            self.camera_offset[0] = max(0, min(world_x - self.screen_width/2, self.world_width - self.screen_width))
+            self.camera_offset[1] = max(0, min(world_y - self.screen_height/2, self.world_height - self.screen_height))
     
     def _render_debug(self, screen, renderer):
         """Render debug information."""
@@ -723,6 +767,14 @@ class Game:
         # If no button found, check additional global commands
         if key == pygame.K_b:
             self._execute_command("build")
+        elif key == pygame.K_u:
+            # If in build selection mode, select unit building
+            if self.build_mode and self.build_type == "select":
+                self._execute_command("build_unit_building")
+        elif key == pygame.K_t:
+            # If in build selection mode, select turret
+            if self.build_mode and self.build_type == "select":
+                self._execute_command("build_turret")
     
     def _execute_command(self, command_type):
         """Execute a command based on its type."""
@@ -731,8 +783,22 @@ class Game:
             workers_selected = any(isinstance(e, Square) and e.player_id == 0 for e in self.selected_entities)
             if workers_selected and self.resources[0] >= self.unit_building_cost:
                 self.build_mode = True
+                self.build_type = "select"
+                self.print_debug_info("Entered build mode - select building type (U: Unit Building, T: Turret)")
+        
+        elif command_type == "build_unit_building":
+            workers_selected = any(isinstance(e, Square) and e.player_id == 0 for e in self.selected_entities)
+            if workers_selected and self.resources[0] >= self.unit_building_cost:
+                self.build_mode = True
                 self.build_type = "unit_building"
-                self.print_debug_info("Entered build mode - click to place building")
+                self.print_debug_info("Building Unit Building - click to place")
+                
+        elif command_type == "build_turret":
+            workers_selected = any(isinstance(e, Square) and e.player_id == 0 for e in self.selected_entities)
+            if workers_selected and self.resources[0] >= 100:  # Turret cost
+                self.build_mode = True
+                self.build_type = "turret"
+                self.print_debug_info("Building Turret - click to place")
         
         # Combat unit commands
         elif command_type == "attack":
@@ -749,7 +815,7 @@ class Game:
                           if isinstance(e, (Dot, Triangle)) and e.player_id == 0]
             if combat_units:
                 self.patrol_mode = True
-                self.print_debug_info("Patrol mode - click start and end points")
+                self.print_debug_info("Patrol mode - click target location")
         
         elif command_type == "hold":
             combat_units = [e for e in self.selected_entities 
@@ -803,10 +869,20 @@ class Game:
                     self.build_mode = False
                     self.build_type = None
                 return
+            elif self.build_type == "turret":
+                if self._try_build_turret(pos):
+                    self.build_mode = False
+                    self.build_type = None
+                return
         
         # If in attack-move mode, set attack-move target
         if self.attack_move_mode:
             self._execute_attack_move(pos)
+            return
+        
+        # If in patrol mode, set patrol target
+        if self.patrol_mode:
+            self._execute_patrol(pos)
             return
         
         # Otherwise handle normal selection
@@ -1066,6 +1142,57 @@ class Game:
         entity.select()
         self.selected_entities.append(entity)
     
+    def _try_build_turret(self, pos=None):
+        """Try to build a defensive turret at the given position."""
+        # Define turret cost
+        turret_cost = 100
+        
+        # Check if we have enough resources
+        if self.resources[0] < turret_cost:
+            self.print_debug_info("Not enough resources to build a turret")
+            return False
+        
+        # Find selected or nearby workers
+        workers = [e for e in self.selected_entities if isinstance(e, Square) and e.player_id == 0]
+        
+        if not workers:
+            self.print_debug_info("No workers selected to build")
+            return False
+        
+        # If position is provided, find the closest worker to that position
+        if pos:
+            closest_worker = min(workers, key=lambda w: distance(w.position, pos))
+            
+            # Check if worker is close enough to build
+            if distance(closest_worker.position, pos) > 150:  # Maximum build distance
+                self.print_debug_info("Worker too far from build location")
+                return False
+                
+            # Use this worker to build
+            worker = closest_worker
+        else:
+            # Just use the first selected worker
+            worker = workers[0]
+            # Generate a position near the worker
+            offset_x = random.randint(-50, 50)
+            offset_y = random.randint(-50, 50)
+            pos = (worker.position[0] + offset_x, worker.position[1] + offset_y)
+        
+        # Build turret and consume the worker
+        self.resources[0] -= turret_cost
+        
+        # Create the building at the specified position
+        build_position = pos
+        
+        # Remove the worker
+        self.print_debug_info(f"Worker {worker} building turret at {build_position}")
+        self.remove_entity(worker)
+        
+        # Create the new turret
+        new_turret = Turret(build_position, player_id=0)
+        self.add_entity(new_turret)
+        return True
+    
     def _restart_game(self):
         """Restart the game."""
         self.entities = []
@@ -1100,4 +1227,27 @@ class Game:
         
         self.attack_move_mode = False
         pygame.mouse.set_visible(True)  # Show default cursor again
-        self.print_debug_info(f"Units attacking-moving to {pos}") 
+        self.print_debug_info(f"Units attacking-moving to {pos}")
+    
+    def _execute_patrol(self, pos):
+        """Set patrol target for selected units."""
+        # Convert screen position to world position
+        world_pos = self._screen_to_world(pos)
+        
+        # Get selected combat units
+        combat_units = [e for e in self.selected_entities 
+                       if isinstance(e, (Dot, Triangle)) and e.player_id == 0]
+        
+        # Set patrol behavior for each unit
+        for unit in combat_units:
+            # Store current position as the start of patrol route
+            start_position = unit.position.copy()
+            # Create patrol behavior
+            unit.current_behavior = PatrolBehavior(unit, start_position, world_pos)
+        
+        # Exit patrol mode
+        self.patrol_mode = False
+        
+        # Show visual feedback
+        if combat_units:
+            self.print_debug_info(f"Units patrolling to {world_pos[0]:.0f}, {world_pos[1]:.0f}") 

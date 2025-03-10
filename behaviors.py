@@ -721,3 +721,69 @@ class AttackMoveBehavior(Behavior):
         if not self.current_target:
             return self.move_behavior.is_finished()
         return False 
+
+class PatrolBehavior(Behavior):
+    """Behavior for patrolling between two points."""
+    
+    def __init__(self, unit, start_position, end_position):
+        """Initialize patrol behavior.
+        
+        Args:
+            unit: The unit to control
+            start_position: Starting patrol point
+            end_position: Ending patrol point
+        """
+        super().__init__(unit)
+        # Fix: Convert to list if needed to safely copy
+        self.start_position = list(start_position) if isinstance(start_position, tuple) else start_position.copy()
+        self.end_position = list(end_position) if isinstance(end_position, tuple) else end_position.copy()
+        self.current_target = self.end_position  # First move to the end
+        self.move_behavior = MoveBehavior(unit, self.current_target)
+        self.is_patrolling = True
+        
+        # Keep track of enemies encountered during patrol
+        self.checking_for_enemies = True
+        print(f"Unit {type(unit).__name__} patrolling between {self.start_position} and {self.end_position}")
+    
+    def update(self, dt):
+        """Update patrol behavior."""
+        # Check for enemies in aggro range while patrolling
+        if self.checking_for_enemies and self.unit.aggro_range > 0:
+            try:
+                # Find enemy entities
+                game_instance = get_game_instance()
+                if game_instance:
+                    for entity in game_instance.entities:
+                        if (hasattr(entity, 'player_id') and entity.player_id != self.unit.player_id and 
+                            hasattr(entity, 'health') and entity.health > 0):
+                            
+                            dist = distance(self.unit.position, entity.position)
+                            
+                            # If enemy is in aggro range, attack it
+                            if dist <= self.unit.aggro_range:
+                                print(f"Patrol unit {type(self.unit).__name__} found enemy at distance {dist:.1f}")
+                                self.unit.attack(entity)
+                                return True  # End patrol to attack
+            except Exception as e:
+                print(f"Error checking for enemies during patrol: {e}")
+        
+        # Update the move behavior
+        finished = self.move_behavior.update(dt)
+        
+        # If reached the current target, switch to the other target
+        if finished:
+            # Swap targets
+            if self.current_target == self.end_position:
+                self.current_target = self.start_position
+            else:
+                self.current_target = self.end_position
+                
+            # Create a new movement behavior for the new target
+            self.move_behavior = MoveBehavior(self.unit, self.current_target)
+            print(f"Patrol: Unit {type(self.unit).__name__} changing direction")
+        
+        return False  # Patrol behavior continues indefinitely
+    
+    def is_finished(self):
+        """Patrol is never finished unless interrupted."""
+        return False 

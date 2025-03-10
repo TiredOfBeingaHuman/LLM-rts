@@ -3,7 +3,7 @@ import math
 import random
 from utils import distance, angle_between, normalize, create_square, create_triangle
 from utils import WHITE, RED, GREEN, BLUE, YELLOW, CYAN
-from behaviors import IdleBehavior, MoveBehavior, GatherBehavior, AttackBehavior, HoldPositionBehavior
+from behaviors import IdleBehavior, MoveBehavior, GatherBehavior, AttackBehavior, HoldPositionBehavior, AttackMoveBehavior, PatrolBehavior
 from typing import List, Tuple, Optional, Union, Dict, Any
 from config import UnitConfig, BuildingConfig, ResourceConfig, MovementConfig
 
@@ -501,6 +501,21 @@ class Unit(Entity):
                 3, RED, 0, True
             )
 
+    def attack_move(self, position):
+        """Order the unit to move to a position while attacking enemies encountered."""
+        self.current_behavior = AttackMoveBehavior(self, position)
+    
+    def hold_position(self):
+        """Order the unit to hold its current position."""
+        self.current_behavior = HoldPositionBehavior(self)
+        
+    def patrol(self, position):
+        """Order the unit to patrol between its current position and the target position."""
+        from behaviors import PatrolBehavior
+        # Store current position as the start of patrol route
+        start_position = self.position.copy()
+        self.current_behavior = PatrolBehavior(self, start_position, position)
+
 
 class Square(Unit):
     """Worker unit that gathers resources. Squares are used to gather resources and build structures."""
@@ -935,5 +950,105 @@ class UnitBuilding(Building):
         
         renderer.draw_polygon(points, self.color, 0, True)
         renderer.draw_polygon(points, WHITE, 2, False)
+        
+        super().render(renderer)  # Draw health bar, selection, etc.
+
+
+class Turret(Building):
+    """Defensive building that attacks nearby enemy units."""
+    
+    def __init__(self, position, player_id=0):
+        color = GREEN if player_id == 0 else RED
+        super().__init__(position, 40, color, 250, player_id)
+        self.attack_range = 150  # Range in pixels
+        self.attack_damage = 10  # Damage per hit
+        self.attack_cooldown_max = 1.0  # Seconds between attacks
+        self.attack_cooldown = 0
+        self.target = None
+        self.rotation = 0.0  # For turret rotation animation
+        
+    def update(self, dt):
+        super().update(dt)
+        
+        # Get game instance
+        game_instance = get_game_instance()
+        if not game_instance:
+            return
+            
+        # Decrease attack cooldown
+        if self.attack_cooldown > 0:
+            self.attack_cooldown -= dt
+            
+        # If we have a target, check if it's still valid
+        if self.target:
+            if not hasattr(self.target, 'health') or self.target.health <= 0 or self.target not in game_instance.entities:
+                self.target = None
+            else:
+                # Calculate distance to target
+                target_dist = math.sqrt((self.position[0] - self.target.position[0])**2 + 
+                                        (self.position[1] - self.target.position[1])**2)
+                
+                # If target moved out of range, stop tracking it
+                if target_dist > self.attack_range:
+                    self.target = None
+                # Attack if cooldown is ready
+                elif self.attack_cooldown <= 0:
+                    self.attack_cooldown = self.attack_cooldown_max
+                    self.target.take_damage(self.attack_damage)
+                    
+                    # Calculate angle for turret barrel rotation
+                    dx = self.target.position[0] - self.position[0]
+                    dy = self.target.position[1] - self.position[1]
+                    self.rotation = math.atan2(dy, dx)
+        
+        # If no target, find closest enemy in range
+        if not self.target:
+            closest_dist = float('inf')
+            closest_enemy = None
+            
+            for entity in game_instance.entities:
+                # Check if entity is an enemy with health
+                if (hasattr(entity, 'player_id') and entity.player_id != self.player_id and 
+                    hasattr(entity, 'health') and entity.health > 0):
+                    
+                    dist = math.sqrt((self.position[0] - entity.position[0])**2 + 
+                                     (self.position[1] - entity.position[1])**2)
+                    
+                    if dist <= self.attack_range and dist < closest_dist:
+                        closest_dist = dist
+                        closest_enemy = entity
+            
+            self.target = closest_enemy
+            
+            # If found a new target, calculate rotation
+            if self.target:
+                dx = self.target.position[0] - self.position[0]
+                dy = self.target.position[1] - self.position[1]
+                self.rotation = math.atan2(dy, dx)
+    
+    def render(self, renderer):
+        # Draw turret base (hexagon)
+        points = []
+        for i in range(6):
+            angle = math.pi/3 * i
+            x = self.position[0] + math.cos(angle) * self.size/2
+            y = self.position[1] + math.sin(angle) * self.size/2
+            points.append((x, y))
+        
+        renderer.draw_polygon(points, self.color, 0, True)
+        renderer.draw_polygon(points, WHITE, 2, False)
+        
+        # Draw turret barrel (line)
+        barrel_length = self.size * 0.8
+        barrel_end = (
+            self.position[0] + math.cos(self.rotation) * barrel_length,
+            self.position[1] + math.sin(self.rotation) * barrel_length
+        )
+        renderer.draw_line(self.position, barrel_end, WHITE, 3)
+        
+        # Draw attack range indicator when selected
+        if self.selected:
+            # Semi-transparent circle for range
+            renderer.draw_circle(self.position, self.attack_range, (255, 255, 255, 70), 1)
         
         super().render(renderer)  # Draw health bar, selection, etc. 

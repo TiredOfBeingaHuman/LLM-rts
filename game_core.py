@@ -33,8 +33,8 @@ class Game:
         self.dt = 0
         
         # World dimensions (larger than screen)
-        self.world_width = 3000
-        self.world_height = 2000
+        self.world_width = 4000
+        self.world_height = 3000
         
         # Game state
         self.paused = False
