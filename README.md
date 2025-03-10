@@ -14,7 +14,9 @@ A real-time strategy game with vector-based graphics inspired by classic games l
 - Building types:
   - Command Center: Main building, collects resources, produces workers
   - Unit Buildings: Produces combat units (dots and triangles)
-- Collision detection and physics
+- Physics-based movement with unit-specific properties
+- Standardized, physics-based movement across all behaviors
+- Collision detection and realistic unit interactions
 - Formation movement for unit groups
 - Enemy AI with resource gathering and combat behavior
 - Debug visualization features
@@ -50,6 +52,14 @@ A real-time strategy game with vector-based graphics inspired by classic games l
 
 ## Recent Updates
 
+### Standardized Movement System (May 2024)
+- Implemented unified movement logic across all unit behaviors
+- Added physics-based movement with momentum, inertia, and deceleration
+- Created unit-specific physics properties for distinctive movement styles
+- Fixed oscillation and jittering issues at movement destinations
+- Optimized resource gathering with improved collision handling
+- Enhanced patrol mode with dedicated 'P' key and visual indicator
+
 ### REFACTOR1 Branch (March 2024)
 - Fixed the patrol feature to work properly with combat units
 - Improved selection box rendering for better unit selection
@@ -73,6 +83,7 @@ The game is structured using the following main components:
 - `behaviors.py`: Behavior classes that implement unit AI (movement, gathering, attacking)
 - `renderer.py`: Handles rendering game elements
 - `utils.py`: Utility functions and constants
+- `config.py`: Centralized configuration for all game parameters
 
 ### Entity Hierarchy
 
@@ -89,12 +100,24 @@ The game is structured using the following main components:
 ### Behavior System
 
 Units use a behavior-based AI system where each unit can have one active behavior:
+- `Behavior`: Base class with standardized movement method used by all behaviors
 - `IdleBehavior`: Default when not doing anything
-- `MoveBehavior`: Moving to a position
-- `GatherBehavior`: Gathering resources
+- `MoveBehavior`: Moving to a position with physics-based momentum
+- `GatherBehavior`: Gathering resources (moving, harvesting, returning, depositing)
 - `AttackBehavior`: Attacking a target
 - `HoldPositionBehavior`: Staying in place but attacking enemies in range
 - `AttackMoveBehavior`: Moving to a position while attacking enemies encountered
+- `PatrolBehavior`: Patrolling between two points and attacking enemies in range
+
+### Movement System
+
+The game uses a physics-based movement system:
+- `_standardized_move_toward`: Common movement method in the base Behavior class
+- Each unit type has custom physics properties:
+  - Mass: Controls momentum and collision response
+  - Friction: Affects how quickly units slow down
+  - Restitution: Controls bouncing during collisions
+  - Steering Force: Influences turning ability and acceleration
 
 ## Performance Considerations
 
@@ -102,6 +125,35 @@ Units use a behavior-based AI system where each unit can have one active behavio
 - Collision detection uses rectangles and spatial partitioning
 - Formation movement with steering behaviors for smooth unit movement
 - Error handling for robustness during extended gameplay
+- Physics optimizations with delta time clamping and velocity cutoff
+
+## Development Notes
+
+### Key Physics Parameters
+- **Unit Mass**: Controls momentum and collision impact
+  - Square (Worker): 1.3x size
+  - Dot (Melee): 1.4x size
+  - Triangle (Ranged): 3.0x size
+
+- **Friction**: Higher values stop faster
+  - Square: 0.96
+  - Dot: 0.95
+  - Triangle: 0.97
+
+- **Target Reached Thresholds**: Distance at which to consider target reached
+  - Square: 25.0
+  - Dot: 35.0
+  - Triangle: 45.0
+
+### Movement Behavior
+- `_standardized_move_toward`: The core movement method that all behaviors use
+- Inside an arrival threshold, units will gradually slow down
+- Deceleration is smooth and proportional to distance from target
+
+### Known Issues
+- If window loses focus, physics may behave erratically (added dt clamping to mitigate)
+- Large groups of units may slow down the game due to collision calculations
+- Very large maps might require spatial partitioning optimization
 
 ## Future Development Plans
 
