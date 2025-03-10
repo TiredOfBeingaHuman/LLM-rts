@@ -55,6 +55,7 @@ Units use a behavior-based AI system where each unit has one active behavior obj
 - `AttackBehavior`: Attacking enemy units/buildings
 - `HoldPositionBehavior`: Defensive stance
 - `AttackMoveBehavior`: Moving while attacking enemies in path
+- `PatrolBehavior`: Patrolling between two points and attacking enemies in range
 
 ### Game Manager
 

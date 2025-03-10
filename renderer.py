@@ -16,7 +16,9 @@ class VectorRenderer:
         self.camera_offset = offset
     
     def apply_camera_offset(self, position):
-        """Apply camera offset to a position."""
+        """Apply camera offset to translate world coordinates to screen coordinates."""
+        if position is None:
+            return None
         return (position[0] - self.camera_offset[0], position[1] - self.camera_offset[1])
     
     def draw_circle(self, center, radius, color=WHITE, width=1, filled=False):
@@ -32,10 +34,18 @@ class VectorRenderer:
         # Apply camera offset to all points
         screen_points = [self.apply_camera_offset(point) for point in points]
         
-        if filled:
-            pygame.draw.polygon(self.screen, color, screen_points)
+        # Handle colors with alpha (opacity)
+        surface = None
+        if len(color) > 3 and filled:
+            # Create a surface with per-pixel alpha
+            surface = pygame.Surface((self.screen.get_width(), self.screen.get_height()), pygame.SRCALPHA)
+            pygame.draw.polygon(surface, color, screen_points)
+            self.screen.blit(surface, (0, 0))
         else:
-            pygame.draw.polygon(self.screen, color, screen_points, width)
+            if filled:
+                pygame.draw.polygon(self.screen, color, screen_points)
+            else:
+                pygame.draw.polygon(self.screen, color, screen_points, width)
     
     def draw_line(self, start, end, color=WHITE, width=1):
         """Draw a line from start to end position."""
@@ -115,12 +125,19 @@ class VectorRenderer:
         font.render_to(self.screen, text_rect, text, color)
     
     def draw_selection_box(self, start, end, color=WHITE):
-        """Draw a selection box from start to end positions."""
-        screen_start = self.apply_camera_offset(start)
-        screen_end = self.apply_camera_offset(end)
+        """Draw a selection box from start to end positions.
         
-        width = screen_end[0] - screen_start[0]
-        height = screen_end[1] - screen_start[1]
+        Args:
+            start: The start position in screen coordinates
+            end: The end position in screen coordinates
+            color: The color to draw the box
+        """
+        # Calculate the box dimensions
+        x = min(start[0], end[0])
+        y = min(start[1], end[1])
+        width = abs(end[0] - start[0])
+        height = abs(end[1] - start[1])
         
-        rect = pygame.Rect(screen_start, (width, height))
+        # Draw the selection box
+        rect = pygame.Rect(x, y, width, height)
         pygame.draw.rect(self.screen, color, rect, 1) 

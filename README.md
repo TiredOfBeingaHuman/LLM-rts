@@ -42,8 +42,20 @@ A real-time strategy game with vector-based graphics inspired by classic games l
 - Drag with left mouse button to select multiple units
 - B: Enter build mode to construct a Unit Building (requires 150 resources)
 - A: Toggle attack-move mode (units will attack enemies encountered on their way)
+- P: Toggle patrol mode for combat units (units will patrol between current position and clicked location)
+- H: Order selected units to hold position (will attack enemies in range without moving)
+- S: Stop all selected units (change to idle behavior)
 - D: Toggle debug visualization (shows slots, paths, and collision info)
 - Escape: Cancel current build/attack mode
+
+## Recent Updates
+
+### REFACTOR1 Branch (March 2024)
+- Fixed the patrol feature to work properly with combat units
+- Improved selection box rendering for better unit selection
+- Updated renderer to handle delta time for animations
+- Fixed issues with coordinate systems in the UI
+- Enhanced combat behavior to properly detect and attack enemies during patrol
 
 ## Gameplay
 
